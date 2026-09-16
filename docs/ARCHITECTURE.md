@@ -548,11 +548,10 @@ flowchart TB
 
 Single QML singleton `GemSight.Core` exposing:
 
-- `DraftController* draft` — owns `RolePredictor` + `DraftEvaluator` sub-objects (or injects shared instances)
-- `AdvisorController* advisor` — mastery-weighted pick list + lane/item adjunct (M4+)
+- `DraftController* draft` — owns `RolePredictor` + `DraftEvaluator` sub-objects (or injects shared instances); calls `AdvisorController::evaluate` on `DraftRefreshing`
+- `AdvisorController* advisor` — **normative Personal Pick Advisor (§5.3)**; `pickRecommendations` model; lane/item adjunct (M4+)
 - `TimerController* timers`
-- `SettingsStore* settings` — `advisor/weightMatchup`, `advisor/weightMastery`, `advisorAggressiveMeta` (see §5.3.2)
-- `AdvisorController* advisor` — **normative pick logic §5.3**; `pickRecommendations` model for QML
+- `SettingsStore* settings` — `advisor/weightMatchup`, `advisor/weightMastery`, `advisorAggressiveMeta` (§5.3.2)
 
 Heavy logic stays in `src/core/**`; façade only forwards signals and registered models (`QAbstractListModel` for enemy columns, threats, recommendations).
 
