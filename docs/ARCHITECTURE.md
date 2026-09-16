@@ -225,7 +225,7 @@ On every transition into **`DraftRefreshing`**, the draft pipeline runs three an
 
 ---
 
-## 5. Draft intelligence engines (v2.2)
+## 5. Draft intelligence engines (v2.3)
 
 Neither GSI nor raw pick events expose reliable **lane/position** labels during hero select. GemSight derives draft intelligence from **STRATZ matrices + pick-order priors + local player profile**, all off the UI thread.
 
@@ -331,40 +331,163 @@ Recompute on worker thread; debounce with draft UI (50 ms).
 
 ### 5.3 Personal Pick Advisor — Mastery-Weighted Counter-Pick (`AdvisorController`)
 
-**Core problem:** Tools that rank only by **matchup WR delta** recommend +10% “paper counters” with **0 lifetime games**, which loses matches. GemSight ranks by **comfort + matchup**.
+> **Normative specification (v2.3).** Implementations **must** follow this section for pick ranking, tier labels, and anti-trap behavior. UI strings are defined here and in `translations/gemsight_*.ts` (`advisor.*` context).
 
-**Scope:** Local player (`GSI player.steamid` / settings) picking for **their** role (from `RolePredictor` on ally team + user preference override).
+**Ownership:** `src/core/advisor/advisor_controller.{h,cpp}` + `src/models/pick_recommendation_model.{h,cpp}`  
+**QML:** `qml/advisor/AdvisorPanel.qml`, `qml/advisor/PickRecommendationChip.qml`  
+**Façade:** `CoreController::advisor()` → `AdvisorController*` (sibling to `DraftController`, not nested inside it).
 
-**Composite score:**
+#### 5.3.1 Core problem
+
+Existing tools (including Dota Coach–class counter lists) **blindly recommend** heroes with the highest statistical matchup advantage (e.g. **+10% winrate delta** vs revealed enemies), even when the local player has **0 games** on that hero. That produces “paper counters” and thrown matches.
+
+**GemSight rule:** rank candidates by a **composite** of bracket matchup edge **and** personal comfort (signature / mastery), then surface **explicit risk chips** when meta and mastery disagree.
+
+**Worked contrast (same draft, same enemies):**
+
+| Hero | Matchup Δ (vs revealed) | Games (lifetime) | Legacy tool rank | GemSight tier |
+|------|-------------------------|------------------|------------------|---------------|
+| Phoenix | +3% | 1000 | #2 (below OD) | **Rank 1 — Recommended** (signature + positive Δ) |
+| Phoenix | −1.5% | 1000 | hidden | **Rank 2 — Viable** (signature mitigates mild minus) |
+| Outworld Destroyer | +10% | 0 | **#1** | **Warning — Meta only** (never default #1) |
+| Phoenix | −8% | 1000 | — | **Warning — High risk** (signature but hard countered) |
+
+#### 5.3.2 Algorithm & scoring
+
+**Candidate set `C`:** all heroes legal for the local player’s **intended position** (from `RolePredictor` on allies + `SettingsStore.preferredPositions`), minus already picked/banned. Pool size capped (~40) by bracket pick rate for performance.
+
+**Matchup advantage** (cumulative vs **already revealed enemy heroes** only):
+
+```text
+MatchupAdvantage(h) = Σ_{e ∈ enemyRevealed} counterDelta(h, e)
+
+counterDelta(h, e) = WR_bracket(h vs e) − 0.5    // STRATZ matchup matrix; clamp to [-0.15, +0.15] per edge
+```
+
+**Personal mastery** (local player STRATZ profile — same `steamAccountId` as GSI `player.steamid`):
+
+```text
+PersonalMastery(h) = clamp01(
+    0.50 * gamesNorm(games_total, h)
+  + 0.30 * gamesNorm(games_30d, h)
+  + 0.20 * winrateNorm(winrate_player, h)
+)
+
+gamesNorm(g, h) = min(1, g / G_cap)     // default G_cap = 300
+winrateNorm(w, h) = clamp((w − 0.45) / 0.20, 0, 1)   // 45% → 0, 65% → 1
+```
+
+**Composite score (sort key, higher = better pick):**
 
 ```text
 Score(h) = (MatchupAdvantage(h) * W_matchup) + (PersonalMastery(h) * W_mastery)
-
-MatchupAdvantage(h) = Σ_{e ∈ revealedEnemies} counterDelta(h, e)   // STRATZ matrix, bracket
-PersonalMastery(h)  = f(games_total, games_30d, winrate_player)   // STRATZ local player profile
 ```
 
-Suggested defaults: `W_matchup=0.55`, `W_mastery=0.45`. `f` is normalized to `[0,1]` with soft cap (e.g. mastery saturates ~300 games).
+| Constant | Default | `SettingsStore` key |
+|----------|---------|-------------------|
+| `W_matchup` | `0.55` | `advisor/weightMatchup` |
+| `W_mastery` | `0.45` | `advisor/weightMastery` |
+| `G_cap` | `300` | `advisor/masteryGameCap` |
+| High mastery threshold | `PersonalMastery ≥ 0.65` | `advisor/signatureMasteryThreshold` |
+| Mild negative matchup | `MatchupAdvantage ≥ −0.015` | `advisor/viableMatchupFloor` |
+| Strong negative matchup | `MatchupAdvantage ≤ −0.08` | `advisor/highRiskMatchupCeiling` |
+| Unplayed hero | `games_total < 1` | `advisor/minGamesPlayed` |
+| “High” paper counter | `MatchupAdvantage ≥ +0.06` | `advisor/metaOnlyAdvantageFloor` |
 
-**Recommendation hierarchy & UI chips (`MD.AssistChip` / advisor list):**
+#### 5.3.3 Signature hero (local player)
 
-| Rank | Condition | Chip copy (RU / i18n key) |
-|------|-----------|---------------------------|
-| **Rank 1 — Recommended** | High mastery **and** `MatchupAdvantage ≥ 0` | «Рекомендуется: комфортный сигнатурный пик с плюсом в драфте» |
-| **Rank 2 — Viable** | High mastery **and** mild negative matchup (e.g. −1.5%) | «Играбельно: лёгкий минус в матчапе, но высокий опыт на герое» |
-| **Warning — Meta only** | High advantage **and** `games_total == 0` (or &lt; threshold) | «Мета-контрпик: осторожно — герой не отыгран» |
-| **Warning — High risk** | Signature hero **and** strong negative matchup (e.g. ≤ −8%) | «Высокий риск: сильные контрпики врага» |
+A hero `h` is a **signature** for the local player when **any** of:
 
-**Anti-trap rule:** When sorting candidates, never let a **0-game** hero outrank a **signature** pick with positive or mildly negative matchup unless user enables “Aggressive meta” in settings.
+- `games_total(h) ≥ 100` **and** `games_total(h) / player.matchCount ≥ 0.08` (8% of career), or  
+- `h` is in the top **3** by `games_total` on `player.heroes` for the active bracket, or  
+- `PersonalMastery(h) ≥ signatureMasteryThreshold` (default 0.65).
 
-**Outputs:**
+Signature status drives **Rank 1/2** eligibility and **High risk** warnings; it is **independent** of enemy signature pools (enemy top heroes stay on `PlayerIntelModel` / draft cards).
 
-- `QAbstractListModel* pickRecommendations()` — roles: `heroId`, `score`, `tier` (Recommended/Viable/Warning), `message`, `matchupAdvantage`, `mastery`
-- Invoked from `DraftController` on each `DraftRefreshing` pass after matrices load.
+#### 5.3.4 Recommendation hierarchy & UI chips
 
-**M4 deliverable:** wire to STRATZ; until then stub with deterministic demo rows tied to `simulateTurboDraft()`.
+After scoring, assign **`PickTier`** (enum) **before** final sort; then sort by `Score` descending within tier groups.
+
+| `PickTier` | Logic (all required conditions) | Default RU message | i18n id |
+|------------|----------------------------------|--------------------|---------|
+| `Recommended` | `isSignature(h)` **and** `MatchupAdvantage(h) ≥ 0` | Рекомендуется: комфортный сигнатурный пик с плюсом в драфте | `advisor.recommendedSignature` |
+| `Viable` | `isSignature(h)` **and** `MatchupAdvantage(h) ≥ viableMatchupFloor` (e.g. −1.5%) | Играбельно: лёгкий минус в матчапе, но сильный опыт на герое | `advisor.viableSignature` |
+| `WarningMetaOnly` | `games_total(h) < minGamesPlayed` **and** `MatchupAdvantage(h) ≥ metaOnlyAdvantageFloor` | Мета-контрпик: осторожно — герой не отыгран | `advisor.warningMetaOnly` |
+| `WarningHighRisk` | `isSignature(h)` **and** `MatchupAdvantage(h) ≤ highRiskMatchupCeiling` | Высокий риск: сильные контрпики врага на сигнатуру | `advisor.warningHighRisk` |
+| `Neutral` | else | Показать `Score`; без акцентного чипа | `advisor.neutral` |
+
+**Chip UI:** `PickRecommendationChip.qml` maps tier → `MD.AssistChip` color (primary / secondary / error / warning). Show **matchup %** and **games** as secondary line (`+3% · 1240 игр`).
+
+#### 5.3.5 Anti-trap & sort order (mandatory)
+
+1. **Primary sort:** tier precedence `Recommended > Viable > Neutral > WarningHighRisk > WarningMetaOnly` (warnings visible but never auto-first).  
+2. **Secondary sort:** `Score(h)` descending.  
+3. **Anti-trap:** If `games_total(h) < minGamesPlayed`, `h` **cannot** outrank any `Recommended` or `Viable` candidate unless `SettingsStore.advisorAggressiveMeta == true`.  
+4. **Cap list:** expose top **8** picks to QML (`take: 8`).
+
+#### 5.3.6 `AdvisorController` — C++ contract
+
+```cpp
+// src/core/advisor/advisor_controller.h (normative surface)
+class AdvisorController : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(PickRecommendationModel* pickRecommendations READ pickRecommendations CONSTANT)
+    Q_PROPERTY(double weightMatchup READ weightMatchup WRITE setWeightMatchup NOTIFY weightsChanged)
+    Q_PROPERTY(double weightMastery READ weightMastery WRITE setWeightMastery NOTIFY weightsChanged)
+    Q_PROPERTY(bool advisorAggressiveMeta READ advisorAggressiveMeta WRITE setAdvisorAggressiveMeta NOTIFY weightsChanged)
+
+public:
+    // Called from DraftController on worker thread; emits recommendationsReady() on GUI thread
+    Q_INVOKABLE void evaluate(const DraftSnapshot& snap,
+                              const StratzMatrices& matrices,
+                              const PlayerHeroStats& localPlayer,
+                              int intendedPosition);
+
+    PickRecommendationModel* pickRecommendations();
+
+signals:
+    void recommendationsReady();
+    void weightsChanged();
+};
+```
+
+`PickRecommendationModel` roles: `heroId`, `heroName`, `score`, `tier` (`int` / enum), `message`, `matchupAdvantage`, `personalMastery`, `gamesTotal`, `games30d`, `isSignature`.
+
+**Lifecycle:**
+
+```text
+DraftRefreshing → (worker) AdvisorController::evaluate(...)
+               → build sorted list + tiers
+               → QMetaObject::invokeMethod → pickRecommendations()->reset(rows)
+               → QML AdvisorPanel ListView updates
+```
+
+**STRATZ inputs (local player, cached per patch):**
+
+```graphql
+query LocalPlayerMastery($id: Long!, $heroTake: Int! = 40) {
+  player(steamAccountId: $id) {
+    matchCount
+    heroes(request: { take: $heroTake }) {
+      heroId
+      matchCount
+      winCount
+    }
+    # extend with recent-window stats when schema exposes gamesLast30d / similar
+  }
+}
+```
+
+#### 5.3.7 Implementation milestones (do not drop from roadmap)
+
+| Milestone | AdvisorController deliverable |
+|-----------|-------------------------------|
+| **M2** | Class stub + `PickRecommendationModel`; demo rows on `simulateTurboDraft()` illustrating all five tiers (Phoenix / OD examples) |
+| **M3** | Real `LocalPlayerMastery` + matchup matrix; live `evaluate()` on each pick delta |
+| **M4** | Lane/item adjunct JSON; settings UI for weights and `advisorAggressiveMeta` |
 
 ---
+
 
 ## 6. End-to-end system architecture
 
@@ -428,7 +551,8 @@ Single QML singleton `GemSight.Core` exposing:
 - `DraftController* draft` — owns `RolePredictor` + `DraftEvaluator` sub-objects (or injects shared instances)
 - `AdvisorController* advisor` — mastery-weighted pick list + lane/item adjunct (M4+)
 - `TimerController* timers`
-- `SettingsStore* settings` — includes `W_matchup`, `W_mastery`, advisor aggressiveness
+- `SettingsStore* settings` — `advisor/weightMatchup`, `advisor/weightMastery`, `advisorAggressiveMeta` (see §5.3.2)
+- `AdvisorController* advisor` — **normative pick logic §5.3**; `pickRecommendations` model for QML
 
 Heavy logic stays in `src/core/**`; façade only forwards signals and registered models (`QAbstractListModel` for enemy columns, threats, recommendations).
 
@@ -458,7 +582,8 @@ gemsight/
 │   │   └── timers/timer_engine.{h,cpp}
 │   └── models/
 │       ├── enemy_team_model.{h,cpp}
-│       └── player_intel_model.{h,cpp}
+│       ├── player_intel_model.{h,cpp}
+│       └── pick_recommendation_model.{h,cpp}   # AdvisorController list
 ├── resources/
 │   └── gsi/gamestate_integration_gemsight.cfg
 └── qml/
@@ -627,4 +752,4 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ---
 
-*Document version: 2.2 — adds `RolePredictor`, `DraftEvaluator` (live WR + lookahead threats), mastery-weighted `AdvisorController`, QML `DraftBalanceBar` / `LookaheadThreatCard`, and M2/M3/M4 milestone split.*
+*Document version: 2.3 — normative `AdvisorController` spec (§5.3): mastery-weighted counter-pick, signature definition, tier chips, anti-trap sort, C++ API, STRATZ mastery query, M2–M4 advisor milestones.*
