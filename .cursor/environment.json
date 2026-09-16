@@ -1,0 +1,3 @@
+{
+  "install": "sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential ninja-build git git-lfs libxkbcommon-dev libxcb-cursor0 libxcb-xkb-dev && pip install -q aqtinstall && export PATH=\"$HOME/.local/bin:$PATH\" && aqt install-qt linux desktop 6.11.2 linux_gcc_64 -m qthttpserver qtshadertools qtwebsockets qttasktree -O \"$HOME/Qt\" || true"
+}

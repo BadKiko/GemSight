@@ -1,0 +1,6 @@
+/build*
+/.cache
+aqtinstall.log
+CMakeUserPresets.json
+*.user
+__pycache__/
