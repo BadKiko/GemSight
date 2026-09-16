@@ -1,0 +1,937 @@
+﻿#Requires -Version 5.1
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$ROOT = $PSScriptRoot
+$BUILD_DIR = Join-Path $ROOT "build-win"
+$BUILD_TYPE = if ($env:BUILD_TYPE) { $env:BUILD_TYPE } else { "RelWithDebInfo" }
+$DIST_DIR = Join-Path $ROOT "dist-win"
+$env:QT_QML_MATERIAL_IMPORT_PATH = Join-Path $BUILD_DIR "qml_modules"
+$env:QML2_IMPORT_PATH = Join-Path $BUILD_DIR "qml_modules"
+
+function Initialize-DevPath {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
+
+function Resolve-GemSightPackageVersion {
+    <#
+      Version for packaged builds. Never returns bare "dev".
+      Order: GEMSIGHT_VERSION env → nearest v* git tag (describe).
+    #>
+    if ($env:GEMSIGHT_VERSION) {
+        $v = $env:GEMSIGHT_VERSION.Trim()
+        if ($v.StartsWith('v') -or $v.StartsWith('V')) { $v = $v.Substring(1) }
+        if ($v -and $v -ne 'dev' -and $v -ne '0.0.0-dev') {
+            return $v
+        }
+    }
+    Push-Location $ROOT
+    try {
+        $desc = & git describe --tags --match 'v*' --dirty 2>$null
+        if ($LASTEXITCODE -eq 0 -and $desc) {
+            $v = $desc.Trim()
+            if ($v.StartsWith('v') -or $v.StartsWith('V')) { $v = $v.Substring(1) }
+            if ($v -and $v -ne 'dev') { return $v }
+        }
+        $tag = & git describe --tags --match 'v*' --abbrev=0 2>$null
+        if ($LASTEXITCODE -eq 0 -and $tag) {
+            $v = $tag.Trim()
+            if ($v.StartsWith('v') -or $v.StartsWith('V')) { $v = $v.Substring(1) }
+            if ($v) { return $v }
+        }
+    } finally {
+        Pop-Location
+    }
+    return $null
+}
+
+function Add-QtInstallRoot {
+    param(
+        [System.Collections.Generic.List[string]]$Roots,
+        [string]$Path
+    )
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    # Kit path …/6.x.y/mingw_64 → install root
+    if (Test-Path -LiteralPath (Join-Path $resolved "lib\cmake\Qt6\Qt6Config.cmake")) {
+        $resolved = Split-Path -Parent (Split-Path -Parent $resolved)
+    }
+    if (-not $Roots.Contains($resolved)) {
+        [void]$Roots.Add($resolved)
+    }
+}
+
+function Get-QtInstallRoots {
+    $roots = [System.Collections.Generic.List[string]]::new()
+    Add-QtInstallRoot $roots $env:QT_INSTALL_DIR
+    Add-QtInstallRoot $roots $env:QTDIR
+    if ($env:CMAKE_PREFIX_PATH) {
+        $p = ($env:CMAKE_PREFIX_PATH -split ';' | Select-Object -First 1)
+        Add-QtInstallRoot $roots $p
+    }
+
+    foreach ($drive in @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' } | ForEach-Object { $_.Name.TrimEnd('\') })) {
+        foreach ($rel in @("Qt", "Qt6", "Dev\Qt", "Dev\QT")) {
+            $p = Join-Path $drive $rel
+            if ((Test-Path -LiteralPath $p) -and -not $roots.Contains($p)) {
+                [void]$roots.Add($p)
+            }
+        }
+    }
+
+    foreach ($p in @(
+            (Join-Path ${env:ProgramFiles} "Qt"),
+            $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} "Qt" }),
+            (Join-Path $env:LOCALAPPDATA "Qt"),
+            (Join-Path $env:USERPROFILE "Qt")
+        )) {
+        if ($p -and (Test-Path -LiteralPath $p) -and -not $roots.Contains($p)) {
+            [void]$roots.Add($p)
+        }
+    }
+
+    # Qt Online Installer often writes InstallLocation (e.g. F:\Dev\QT).
+    foreach ($hive in @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        )) {
+        if (-not (Test-Path -LiteralPath $hive)) { continue }
+        Get-ChildItem -LiteralPath $hive -ErrorAction SilentlyContinue | ForEach-Object {
+            $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            if (-not $props) { return }
+            $nameProp = $props.PSObject.Properties["DisplayName"]
+            $locProp = $props.PSObject.Properties["InstallLocation"]
+            if (-not $nameProp -or -not $locProp) { return }
+            $name = [string]$nameProp.Value
+            $loc = [string]$locProp.Value
+            if (-not $name -or $name -notmatch '(?i)^Qt' -or -not $loc) { return }
+            Add-QtInstallRoot $roots $loc.TrimEnd('\')
+        }
+    }
+
+    return @($roots)
+}
+
+function Get-QtToolsRoot {
+    param([string]$KitPrefix)
+    if (-not $KitPrefix) { return $null }
+    # <root>/<version>/<kit> → <root>/Tools
+    $versionRoot = Split-Path -Parent $KitPrefix
+    $installRoot = Split-Path -Parent $versionRoot
+    foreach ($tools in @(
+            (Join-Path $installRoot "Tools"),
+            (Join-Path $versionRoot "Tools")
+        )) {
+        if (Test-Path -LiteralPath $tools) { return $tools }
+    }
+    foreach ($root in (Get-QtInstallRoots)) {
+        $tools = Join-Path $root "Tools"
+        if (Test-Path -LiteralPath $tools) { return $tools }
+    }
+    return $null
+}
+
+function Find-MingwBinDir {
+    param([string]$KitPrefix)
+
+    $tools = Get-QtToolsRoot $KitPrefix
+    if ($tools) {
+        $mingwDirs = Get-ChildItem -LiteralPath $tools -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^mingw' } |
+            Sort-Object Name -Descending
+        foreach ($dir in $mingwDirs) {
+            $bin = Join-Path $dir.FullName "bin"
+            if (Test-Path -LiteralPath (Join-Path $bin "g++.exe")) {
+                return $bin
+            }
+        }
+    }
+
+    $fromPath = Get-Command gcc.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+    if ($fromPath) {
+        return (Split-Path -Parent $fromPath)
+    }
+    return $null
+}
+
+function Find-NinjaDir {
+    param([string]$KitPrefix)
+
+    $tools = Get-QtToolsRoot $KitPrefix
+    if ($tools) {
+        foreach ($name in @("Ninja", "Ninja_64")) {
+            $bin = Join-Path $tools $name
+            if (Test-Path -LiteralPath (Join-Path $bin "ninja.exe")) { return $bin }
+            if (Test-Path -LiteralPath (Join-Path $bin "bin\ninja.exe")) { return (Join-Path $bin "bin") }
+        }
+    }
+
+    $fromPath = Get-Command ninja.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+    if ($fromPath) {
+        return (Split-Path -Parent $fromPath)
+    }
+    return $null
+}
+
+function Resolve-Cmake {
+    Initialize-DevPath
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $fromPath = Get-Command cmake -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+    if ($fromPath) { [void]$candidates.Add($fromPath) }
+
+    foreach ($root in (Get-QtInstallRoots)) {
+        $tools = Join-Path $root "Tools"
+        if (-not (Test-Path -LiteralPath $tools)) { continue }
+        Get-ChildItem -LiteralPath $tools -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^CMake' } |
+            ForEach-Object {
+                $exe = Join-Path $_.FullName "bin\cmake.exe"
+                if (Test-Path -LiteralPath $exe) { [void]$candidates.Add($exe) }
+            }
+    }
+
+    foreach ($pf in @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if (-not $pf) { continue }
+        $exe = Join-Path $pf "CMake\bin\cmake.exe"
+        if (Test-Path -LiteralPath $exe) { [void]$candidates.Add($exe) }
+    }
+
+    $unique = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+    if ($unique) { return @($unique)[0] }
+    throw "cmake not found. Install CMake, or set PATH / install Qt Online Installer Tools → CMake."
+}
+
+function Get-QtKitKind {
+    param([string]$Prefix)
+    if ($Prefix -match 'mingw') { return 'mingw_64' }
+    if ($Prefix -match 'msvc') { return 'msvc2022_64' }
+    return 'unknown'
+}
+
+function Find-QtKit {
+    foreach ($raw in @($env:CMAKE_PREFIX_PATH, $env:QTDIR)) {
+        if (-not $raw) { continue }
+        $prefix = ($raw -split ';' | Select-Object -First 1)
+        if (-not $prefix) { continue }
+        $qt6Config = Join-Path $prefix "lib\cmake\Qt6\Qt6Config.cmake"
+        if (Test-Path -LiteralPath $qt6Config) {
+            return @{ Prefix = (Resolve-Path -LiteralPath $prefix).Path; Kind = (Get-QtKitKind $prefix) }
+        }
+    }
+
+    $kitPreference = @("mingw_64", "msvc2022_64", "msvc2019_64")
+    if ($env:GEMSIGHT_QT_KIT) {
+        $kitPreference = @($env:GEMSIGHT_QT_KIT) + $kitPreference
+    }
+
+    foreach ($root in (Get-QtInstallRoots)) {
+        $versions = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "^\d+\.\d+" } |
+            Sort-Object {
+                try { [version]$_.Name } catch { [version]"0.0" }
+            } -Descending
+
+        foreach ($versionDir in $versions) {
+            foreach ($kitName in ($kitPreference | Select-Object -Unique)) {
+                $kit = Join-Path $versionDir.FullName $kitName
+                $qt6Config = Join-Path $kit "lib\cmake\Qt6\Qt6Config.cmake"
+                if (Test-Path -LiteralPath $qt6Config) {
+                    return @{ Prefix = $kit; Kind = (Get-QtKitKind $kit) }
+                }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-BuildArgs {
+    $qt = Find-QtKit
+    if (-not $qt) {
+        throw @"
+Qt kit not found.
+Set CMAKE_PREFIX_PATH to a Qt6 kit (…/6.x.y/mingw_64 or …/msvc2022_64),
+or QT_INSTALL_DIR to your Qt root (the folder that contains version dirs / Tools).
+"@
+    }
+
+    $cmake = Resolve-Cmake
+    $gemsightVersion = if ($env:GEMSIGHT_VERSION -and $env:GEMSIGHT_VERSION -ne 'dev') { $env:GEMSIGHT_VERSION } else { '0.1.0-dev' }
+    $configureArgs = @(
+        "-S", $ROOT,
+        "-B", $BUILD_DIR,
+        "-DCMAKE_BUILD_TYPE=$BUILD_TYPE",
+        "-DCMAKE_PREFIX_PATH=$($qt.Prefix)",
+        "-DGEMSIGHT_VERSION=$gemsightVersion"
+    )
+
+    if ($env:CMAKE_C_COMPILER_LAUNCHER) {
+        $configureArgs += "-DCMAKE_C_COMPILER_LAUNCHER=$($env:CMAKE_C_COMPILER_LAUNCHER)"
+    }
+    if ($env:CMAKE_CXX_COMPILER_LAUNCHER) {
+        $configureArgs += "-DCMAKE_CXX_COMPILER_LAUNCHER=$($env:CMAKE_CXX_COMPILER_LAUNCHER)"
+    }
+    if ($env:FETCHCONTENT_BASE_DIR) {
+        New-Item -ItemType Directory -Force -Path $env:FETCHCONTENT_BASE_DIR | Out-Null
+        $fetchDir = ($env:FETCHCONTENT_BASE_DIR -replace '\\', '/')
+        $configureArgs += "-DFETCHCONTENT_BASE_DIR=$fetchDir"
+    }
+
+    if ($qt.Kind -eq "mingw_64") {
+        $mingwBin = Find-MingwBinDir $qt.Prefix
+        if (-not $mingwBin) {
+            throw "MinGW not found next to Qt (Tools/mingw*_64) and gcc.exe is not on PATH."
+        }
+        $gcc = (Join-Path $mingwBin "gcc.exe") -replace '\\', '/'
+        $gxx = (Join-Path $mingwBin "g++.exe") -replace '\\', '/'
+        $pathParts = @($mingwBin)
+        $ninjaDir = Find-NinjaDir $qt.Prefix
+        if ($ninjaDir) { $pathParts += $ninjaDir }
+        $env:Path = ($pathParts -join ";") + ";" + $env:Path
+        return @{
+            Qt = $qt
+            Cmake = $cmake
+            Configure = $configureArgs + @("-G", "Ninja", "-DCMAKE_C_COMPILER=$gcc", "-DCMAKE_CXX_COMPILER=$gxx")
+        }
+    }
+
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
+        $cl = $null
+        if ($env:VCToolsInstallDir) {
+            $clCandidate = Join-Path $env:VCToolsInstallDir "bin\Hostx64\x64\cl.exe"
+            if (Test-Path -LiteralPath $clCandidate) { $cl = $clCandidate }
+        }
+        if (-not $cl) {
+            $cl = Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+        }
+        if ($ninja -and $cl) {
+            $clForCmake = ($cl -replace '\\', '/')
+            $configureExtras = @(
+                "-G", "Ninja",
+                "-DCMAKE_C_COMPILER=$clForCmake",
+                "-DCMAKE_CXX_COMPILER=$clForCmake"
+            )
+            if ($env:WindowsSdkDir -and $env:WindowsSDKVersion) {
+                $sdkVer = $env:WindowsSDKVersion.TrimEnd('\')
+                $sdkBin = Join-Path $env:WindowsSdkDir "bin\$sdkVer\x64"
+                foreach ($pair in @(
+                        @{ Flag = "CMAKE_RC_COMPILER"; Name = "rc.exe" },
+                        @{ Flag = "CMAKE_MT"; Name = "mt.exe" }
+                    )) {
+                    $tool = Join-Path $sdkBin $pair.Name
+                    if (Test-Path -LiteralPath $tool) {
+                        $toolForCmake = ($tool -replace '\\', '/')
+                        $configureExtras += "-D$($pair.Flag)=$toolForCmake"
+                    }
+                }
+            }
+            if ($env:VCToolsInstallDir) {
+                $linkCandidate = Join-Path $env:VCToolsInstallDir "bin\Hostx64\x64\link.exe"
+                if (Test-Path -LiteralPath $linkCandidate) {
+                    $linkForCmake = ($linkCandidate -replace '\\', '/')
+                    $configureExtras += "-DCMAKE_LINKER=$linkForCmake"
+                }
+            }
+            return @{
+                Qt = $qt
+                Cmake = $cmake
+                Configure = $configureArgs + $configureExtras
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $vswhere) {
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($vsPath) {
+            return @{
+                Qt = $qt
+                Cmake = $cmake
+                Configure = $configureArgs + @("-G", "Visual Studio 17 2022", "-A", "x64")
+            }
+        }
+    }
+
+    throw "MSVC kit found but Visual Studio Build Tools are missing."
+}
+
+function Get-AppPath {
+    $candidates = @(
+        (Join-Path $BUILD_DIR "gemsight_app.exe"),
+        (Join-Path $BUILD_DIR "$BUILD_TYPE\gemsight_app.exe")
+    )
+    foreach ($path in $candidates) {
+        if (Test-Path -LiteralPath $path) { return (Resolve-Path -LiteralPath $path).Path }
+    }
+    return (Join-Path $ROOT $candidates[0])
+}
+
+function Ensure-BuildDir {
+    param([hashtable]$Qt)
+
+    if (-not $Qt) { return }
+    $expected = if ($Qt.Kind -eq "mingw_64") {
+        "Ninja"
+    } elseif ($env:GITHUB_ACTIONS -eq 'true') {
+        "Ninja"
+    } else {
+        "Visual Studio 17 2022"
+    }
+
+    $cache = Join-Path $BUILD_DIR "CMakeCache.txt"
+    $mismatch = $false
+    if (Test-Path -LiteralPath $cache) {
+        $line = Select-String -Path $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1
+        if ($line -and $line.Line -notmatch [regex]::Escape($expected)) { $mismatch = $true }
+    }
+
+    if (-not $mismatch) {
+        $deps = Join-Path $BUILD_DIR "_deps"
+        if (Test-Path -LiteralPath $deps) {
+            Get-ChildItem -Path $deps -Filter CMakeCache.txt -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                $line = Select-String -Path $_.FullName -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1
+                if ($line -and $line.Line -notmatch [regex]::Escape($expected)) { $mismatch = $true }
+            }
+        }
+    }
+
+    if ($mismatch) {
+        Write-Host "Cleaning build-win (generator mismatch)" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $BUILD_DIR -Recurse -Force
+    }
+}
+
+function Find-VulkanBinDir {
+    if ($env:VULKAN_SDK) {
+        $bin = Join-Path $env:VULKAN_SDK "Bin"
+        if (Test-Path -LiteralPath $bin) { return $bin }
+    }
+    foreach ($root in @(
+            "C:\VulkanSDK",
+            (Join-Path ${env:ProgramFiles} "VulkanSDK"),
+            (Join-Path $env:LOCALAPPDATA "VulkanSDK")
+        )) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $latest = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+        if (-not $latest) { continue }
+        $bin = Join-Path $latest.FullName "Bin"
+        if (Test-Path -LiteralPath $bin) { return $bin }
+    }
+    return $null
+}
+
+function Initialize-QtRuntime {
+    param([hashtable]$Qt)
+
+    if (-not $Qt) { return }
+
+    $runtimePaths = [System.Collections.Generic.List[string]]::new()
+    $qtBin = Join-Path $Qt.Prefix "bin"
+    if (Test-Path -LiteralPath $qtBin) { [void]$runtimePaths.Add($qtBin) }
+
+    if ($Qt.Kind -eq "mingw_64") {
+        $mingwBin = Find-MingwBinDir $Qt.Prefix
+        if ($mingwBin) { [void]$runtimePaths.Add($mingwBin) }
+        $ninjaDir = Find-NinjaDir $Qt.Prefix
+        if ($ninjaDir) { [void]$runtimePaths.Add($ninjaDir) }
+    }
+
+    $vulkanBin = Find-VulkanBinDir
+    if ($vulkanBin) {
+        $runtimePaths.Insert(0, $vulkanBin)
+    }
+
+    if ($runtimePaths.Count -gt 0) {
+        $env:Path = ($runtimePaths -join ";") + ";" + $env:Path
+    }
+
+    $qtPlugins = Join-Path $Qt.Prefix "plugins"
+    if (Test-Path -LiteralPath $qtPlugins) {
+        $env:QT_PLUGIN_PATH = $qtPlugins
+    }
+}
+
+function Test-QtRuntimeDeployed {
+    param([string]$AppDir)
+
+    $required = @(
+        (Join-Path $AppDir "Qt6Core.dll"),
+        (Join-Path $AppDir "Qt6Gui.dll"),
+        (Join-Path $AppDir "Qt6Qml.dll"),
+        (Join-Path $AppDir "Qt6Quick.dll"),
+        (Join-Path $AppDir "platforms\qwindows.dll")
+    )
+    foreach ($path in $required) {
+        if (-not (Test-Path -LiteralPath $path)) { return $false }
+    }
+    return $true
+}
+
+function Assert-QmlModulePluginsPresent {
+    param([string]$QmlModulesDir)
+
+    if (-not (Test-Path -LiteralPath $QmlModulesDir)) { return }
+
+    $missing = @()
+    Get-ChildItem -LiteralPath $QmlModulesDir -Recurse -Filter "qmldir" -File | ForEach-Object {
+        $dir = $_.Directory.FullName
+        foreach ($line in Get-Content -LiteralPath $_.FullName) {
+            if ($line -match '^\s*plugin\s+(\S+)') {
+                $name = $Matches[1]
+                $candidates = @(
+                    (Join-Path $dir "$name.dll"),
+                    (Join-Path $dir "lib$name.dll"),
+                    (Join-Path $dir "lib$name.so"),
+                    (Join-Path $dir "$name.so")
+                )
+                $found = $false
+                foreach ($c in $candidates) {
+                    if (Test-Path -LiteralPath $c) { $found = $true; break }
+                }
+                if (-not $found) {
+                    $missing += "$($_.FullName): plugin '$name' not found next to qmldir"
+                }
+            }
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw ("QML module plugin(s) missing from package:`n  " + ($missing -join "`n  "))
+    }
+}
+
+function Deploy-QtRuntime {
+    param(
+        [hashtable]$Qt,
+        [string]$AppPath
+    )
+
+    if (-not $Qt -or -not (Test-Path -LiteralPath $AppPath)) { return }
+
+    $appDir = Split-Path -Parent $AppPath
+    if (Test-QtRuntimeDeployed $appDir) { return }
+
+    $windeployqt = Join-Path $Qt.Prefix "bin\windeployqt.exe"
+    if (-not (Test-Path -LiteralPath $windeployqt)) {
+        Write-Host "windeployqt not found; relying on PATH for Qt DLLs" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Deploying Qt runtime ..."
+    $qmlDir = Join-Path $ROOT "qml"
+    $qmlModules = Join-Path $BUILD_DIR "qml_modules"
+    & $windeployqt --qmldir $qmlDir --qmldir $qmlModules --no-translations $AppPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "windeployqt failed with exit code $LASTEXITCODE"
+    }
+
+    Resolve-WindowsTlsRuntime -DestDir $appDir -QtPrefix $Qt.Prefix
+}
+
+function New-ReleasePackage {
+    Enable-CompileCache
+    $resolved = Resolve-GemSightPackageVersion
+    if ($resolved) {
+        $env:GEMSIGHT_VERSION = $resolved
+        Write-Host "Package version: $resolved" -ForegroundColor Cyan
+    }
+    $plan = Get-BuildArgs
+    Ensure-BuildDir $plan.Qt
+    Initialize-QtRuntime $plan.Qt
+
+    $needsConfigure = Test-NeedsCmakeConfigure
+    if ($resolved) {
+        # Stamp real version into the binary (avoid shipping leftover "dev" from day-to-day builds)
+        $needsConfigure = $true
+    }
+    if ($needsConfigure) {
+        Write-Host "CMake configure ..."
+        $configureArgs = $plan.Configure
+        & $plan.Cmake @configureArgs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    }
+
+    Write-Host "Build ..."
+    & $plan.Cmake --build $BUILD_DIR --target gemsight_app -j $env:NUMBER_OF_PROCESSORS
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    $appPath = Get-AppPath
+    if (-not (Test-Path -LiteralPath $appPath)) {
+        throw "gemsight_app.exe not found after build."
+    }
+
+    if (Test-Path -LiteralPath $DIST_DIR) {
+        Remove-Item -LiteralPath $DIST_DIR -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $DIST_DIR | Out-Null
+
+    $distExe = Join-Path $DIST_DIR "gemsight_app.exe"
+    Copy-Item -LiteralPath $appPath -Destination $distExe -Force
+
+    @"
+[Paths]
+Prefix=.
+Plugins=.
+Qml2Imports=qml
+Imports=qml
+"@ | Set-Content -LiteralPath (Join-Path $DIST_DIR "qt.conf") -Encoding ASCII
+
+    $qmlModulesBuilt = Join-Path $BUILD_DIR "qml_modules"
+    if (Test-Path -LiteralPath $qmlModulesBuilt) {
+        Copy-Item -LiteralPath $qmlModulesBuilt -Destination (Join-Path $DIST_DIR "qml_modules") -Recurse -Force
+        Assert-QmlModulePluginsPresent -QmlModulesDir (Join-Path $DIST_DIR "qml_modules")
+    }
+
+    $windeployqt = Join-Path $plan.Qt.Prefix "bin\windeployqt.exe"
+    if (-not (Test-Path -LiteralPath $windeployqt)) {
+        throw "windeployqt not found at $windeployqt"
+    }
+
+    Write-Host "Deploying Qt runtime to dist-win ..."
+    $qmlDir = Join-Path $ROOT "qml"
+    $qmlModules = Join-Path $BUILD_DIR "qml_modules"
+    & $windeployqt --qmldir $qmlDir --qmldir $qmlModules --no-translations $distExe
+    if ($LASTEXITCODE -ne 0) {
+        throw "windeployqt failed with exit code $LASTEXITCODE"
+    }
+
+    $qtNetworkAccess = Join-Path $plan.Qt.Prefix "plugins\\networkaccess"
+    if (Test-Path -LiteralPath $qtNetworkAccess) {
+        Copy-Item -LiteralPath $qtNetworkAccess -Destination (Join-Path $DIST_DIR "networkaccess") -Recurse -Force
+    }
+
+    Resolve-WindowsTlsRuntime -DestDir $DIST_DIR -QtPrefix $plan.Qt.Prefix
+
+    $qmlMaterialDll = Join-Path $BUILD_DIR "qml_material.dll"
+    if (Test-Path -LiteralPath $qmlMaterialDll) {
+        Copy-Item -LiteralPath $qmlMaterialDll -Destination (Join-Path $DIST_DIR "qml_material.dll") -Force
+    }
+
+    $zipName = "GemSight-win64-$BUILD_TYPE.zip"
+    $zipPath = Join-Path $ROOT $zipName
+    if (Test-Path -LiteralPath $zipPath) {
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    Write-Host "Packaging $zipName ..."
+    Compress-Archive -Path (Join-Path $DIST_DIR "*") -DestinationPath $zipPath -Force
+
+    Write-Host ""
+    Write-Host "Done: $zipPath" -ForegroundColor Green
+}
+
+function Resolve-WindowsTlsRuntime {
+    param(
+        [string]$DestDir,
+        [string]$QtPrefix
+    )
+
+    # windeployqt copies tls/qopensslbackend.dll, but not OpenSSL itself. Loading that
+    # plugin without libssl/libcrypto aborts the process with a Windows system error.
+    $opensslDlls = @('libssl-3-x64.dll', 'libcrypto-3-x64.dll')
+    $searchRoots = New-Object System.Collections.Generic.List[string]
+
+    if ($env:IQTA_TOOLS) { [void]$searchRoots.Add($env:IQTA_TOOLS) }
+    if ($QtPrefix) {
+        [void]$searchRoots.Add((Join-Path $QtPrefix "bin"))
+        $qtVersionRoot = Split-Path -Parent $QtPrefix
+        $qtInstallRoot = Split-Path -Parent $qtVersionRoot
+        [void]$searchRoots.Add((Join-Path $qtInstallRoot "Tools"))
+        [void]$searchRoots.Add((Join-Path $qtVersionRoot "Tools"))
+    }
+    foreach ($pathEntry in ($env:Path -split ';')) {
+        if (-not $pathEntry) { continue }
+        if ($pathEntry -match '(?i)openssl') { [void]$searchRoots.Add($pathEntry) }
+    }
+
+    $missing = @()
+    foreach ($dllName in $opensslDlls) {
+        $dest = Join-Path $DestDir $dllName
+        if (Test-Path -LiteralPath $dest) { continue }
+
+        $found = $null
+        foreach ($root in ($searchRoots | Select-Object -Unique)) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            $match = Get-ChildItem -LiteralPath $root -Filter $dllName -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($match) {
+                $found = $match.FullName
+                break
+            }
+        }
+
+        if ($found) {
+            Copy-Item -LiteralPath $found -Destination $dest -Force
+            Write-Host "Bundled OpenSSL: $dllName"
+        } else {
+            $missing += $dllName
+        }
+    }
+
+    if ($missing.Count -eq 0) { return }
+
+    $opensslBackend = Join-Path $DestDir "tls\qopensslbackend.dll"
+    if (Test-Path -LiteralPath $opensslBackend) {
+        Remove-Item -LiteralPath $opensslBackend -Force
+        Write-Host "Removed tls\qopensslbackend.dll (OpenSSL DLLs missing: $($missing -join ', '); using Schannel)" -ForegroundColor Yellow
+    }
+}
+
+function Test-CmakeBuildFilesPresent {
+    $cache = Join-Path $BUILD_DIR "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { return $false }
+
+    $genLine = Select-String -Path $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1
+    if (-not $genLine) { return $false }
+
+    if ($genLine.Line -match 'Ninja') {
+        return (Test-Path -LiteralPath (Join-Path $BUILD_DIR "build.ninja"))
+    }
+    if ($genLine.Line -match 'Visual Studio') {
+        $sln = Get-ChildItem -LiteralPath $BUILD_DIR -Filter "*.sln" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        return [bool]$sln
+    }
+    if ($genLine.Line -match 'Unix Makefiles') {
+        return (Test-Path -LiteralPath (Join-Path $BUILD_DIR "Makefile"))
+    }
+    return $true
+}
+
+function Test-NeedsCmakeConfigure {
+    $cache = Join-Path $BUILD_DIR "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { return $true }
+    if (-not (Test-CmakeBuildFilesPresent)) {
+        Write-Host "Reconfigure: CMake cache exists but build files are missing (incomplete configure)" -ForegroundColor Yellow
+        return $true
+    }
+
+    $cacheTime = (Get-Item -LiteralPath $cache).LastWriteTimeUtc
+    $inputs = @((Join-Path $ROOT "CMakeLists.txt"))
+    Get-ChildItem -LiteralPath (Join-Path $ROOT "cmake") -Filter "*.cmake" -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $inputs += $_.FullName }
+
+    foreach ($input in $inputs) {
+        if ((Get-Item -LiteralPath $input).LastWriteTimeUtc -gt $cacheTime) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Enable-CompileCache {
+    # Honor launchers already set by CI (sccache-action / env), but resolve to a
+    # full path — on Windows Ninja CreateProcess fails for bare "sccache".
+    foreach ($var in @('CMAKE_C_COMPILER_LAUNCHER', 'CMAKE_CXX_COMPILER_LAUNCHER')) {
+        $value = [Environment]::GetEnvironmentVariable($var)
+        if (-not $value) { continue }
+        if (Test-Path -LiteralPath $value) { continue }
+        $cmd = Get-Command $value -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            [Environment]::SetEnvironmentVariable($var, $cmd.Source)
+        }
+    }
+    if ($env:CMAKE_CXX_COMPILER_LAUNCHER -and $env:CMAKE_C_COMPILER_LAUNCHER) {
+        return
+    }
+    foreach ($name in @("sccache", "ccache")) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) {
+            $env:CMAKE_C_COMPILER_LAUNCHER = $cmd.Source
+            $env:CMAKE_CXX_COMPILER_LAUNCHER = $cmd.Source
+            Write-Host "Compile cache: $name ($($cmd.Source))"
+            return
+        }
+    }
+}
+
+function Ensure-DevBuild {
+    Enable-CompileCache
+    $plan = Get-BuildArgs
+    Ensure-BuildDir $plan.Qt
+    Initialize-QtRuntime $plan.Qt
+
+    $appPath = Get-AppPath
+    if (Test-Path -LiteralPath $appPath) {
+        Deploy-QtRuntime $plan.Qt $appPath
+    }
+
+    if (Test-NeedsCmakeConfigure) {
+        Write-Host "CMake configure ..."
+        $configureArgs = $plan.Configure
+        & $plan.Cmake @configureArgs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    }
+
+    Write-Host "Build ..."
+    & $plan.Cmake --build $BUILD_DIR --target gemsight_app -j $env:NUMBER_OF_PROCESSORS
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    $appPath = Get-AppPath
+    if (Test-Path -LiteralPath $appPath) {
+        Deploy-QtRuntime $plan.Qt $appPath
+    }
+}
+
+function Get-GemSightDataDir {
+    Join-Path $env:APPDATA "GemSight"
+}
+
+function Format-ExitCode {
+    param([int]$Code)
+    if ($Code -eq 0) { return "0" }
+    if ($Code -lt 0) {
+        $unsigned = [uint32]$Code
+        return "0x{0:X8} ({1})" -f $unsigned, $Code
+    }
+    return "$Code"
+}
+
+function Get-LogTail {
+    param(
+        [string]$Path,
+        [int]$Lines = 40
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction SilentlyContinue)
+}
+
+function Show-CrashReport {
+    param(
+        [int]$ExitCode,
+        [string]$AppPath
+    )
+
+    $dataDir = Get-GemSightDataDir
+    $crashLog = Join-Path $dataDir "crash.log"
+    $runLog = Join-Path $dataDir "run.log"
+    $issueUrl = "https://github.com/BadKiko/GemSight/issues/new"
+    $exitLabel = Format-ExitCode $ExitCode
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host " GemSight stopped unexpectedly" -ForegroundColor Red
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "Exit code: $exitLabel"
+    Write-Host "Exe:       $AppPath"
+    Write-Host "Logs:      $dataDir"
+    Write-Host ""
+
+    $crashTail = Get-LogTail $crashLog 20
+    if ($crashTail.Count -gt 0) {
+        Write-Host "--- crash.log (last lines) ---" -ForegroundColor Yellow
+        $crashTail | ForEach-Object { Write-Host $_ }
+        Write-Host ""
+    }
+
+    $runTail = Get-LogTail $runLog 30
+    if ($runTail.Count -gt 0) {
+        Write-Host "--- run.log (last lines) ---" -ForegroundColor Yellow
+        $runTail | ForEach-Object { Write-Host $_ }
+        Write-Host ""
+    }
+
+    Write-Host "Please report this on GitHub (attach the log tail above):" -ForegroundColor Cyan
+    Write-Host $issueUrl -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Press Enter to close this window ..."
+    [void][System.Console]::ReadLine()
+}
+
+function Invoke-GemSightApp {
+    param(
+        [string]$AppPath,
+        [string[]]$AppArgs
+    )
+
+    $env:GEMSIGHT_DEV_RUN = "1"
+    Write-Host "Run $AppPath"
+    Write-Host ""
+
+    & $AppPath @AppArgs
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        Show-CrashReport -ExitCode $exitCode -AppPath $AppPath
+    }
+
+    exit $exitCode
+}
+
+$remainingArgs = [System.Collections.Generic.List[string]]::new()
+$runOnly = $false
+$argsList = @($args)
+$i = 0
+while ($i -lt $argsList.Count) {
+    switch ($argsList[$i]) {
+        { $_ -in "-r", "--rebuild" } {
+            if (Test-Path -LiteralPath $BUILD_DIR) {
+                Remove-Item -LiteralPath $BUILD_DIR -Recurse -Force
+            }
+            $i++
+            continue
+        }
+        { $_ -in "--run" } {
+            $runOnly = $true
+            $i++
+            continue
+        }
+        { $_ -in "--release" } {
+            $script:BUILD_TYPE = "Release"
+            $i++
+            continue
+        }
+        { $_ -in "--package" } {
+            if ($script:BUILD_TYPE -eq "RelWithDebInfo" -and -not $env:BUILD_TYPE) {
+                $script:BUILD_TYPE = "Release"
+            }
+            New-ReleasePackage
+            exit 0
+        }
+        { $_ -in "-h", "--help" } {
+            @"
+GemSight dev launcher
+
+  .\run.ps1              configure (if needed) + build + run
+  .\run.ps1 --rebuild    clean build-win, then build + run
+  .\run.ps1 --run        run without build (exe must exist)
+  .\run.ps1 --package    build Release + create dist-win ZIP (GemSight-win64-Release.zip)
+  .\run.ps1 --release    use Release build type (still runs app unless combined with --package)
+  BUILD_TYPE=RelWithDebInfo .\run.ps1 --package   debug symbols in the package (larger ZIP)
+
+Pass app args after options, e.g. .\run.ps1 -- --some-flag
+
+Env:
+  BUILD_TYPE (default RelWithDebInfo)
+  CMAKE_PREFIX_PATH / QTDIR     Qt6 kit path (…/6.x.y/mingw_64 or msvc2022_64)
+  QT_INSTALL_DIR                Qt root (contains version dirs + Tools)
+  GEMSIGHT_QT_KIT               prefer kit name, e.g. mingw_64 or msvc2022_64
+  GEMSIGHT_VERSION              app version passed to CMake (default 0.1.0-dev)
+  FETCHCONTENT_BASE_DIR         cache dir for QmlMaterial FetchContent
+"@
+            exit 0
+        }
+        default { $remainingArgs.Add($argsList[$i]) | Out-Null; $i++ }
+    }
+}
+
+if (-not $runOnly) {
+    Ensure-DevBuild
+}
+
+$APP = Get-AppPath
+if (-not (Test-Path -LiteralPath $APP)) {
+    throw "gemsight_app.exe not found. Run without --run first."
+}
+
+$plan = Get-BuildArgs
+Initialize-QtRuntime $plan.Qt
+Deploy-QtRuntime $plan.Qt $APP
+
+Invoke-GemSightApp -AppPath $APP -AppArgs $remainingArgs

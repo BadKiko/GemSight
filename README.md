@@ -11,7 +11,24 @@ export PATH="$QT_INSTALL_DIR/bin:$PATH"
 ./run.sh
 ```
 
-Windows: use Qt 6.11+ MSVC kit, same CMake options, launch `gemsight_app`.
+## Build (Windows)
+
+Qt **6.11+** (MinGW or MSVC kit from Qt Online Installer). From repo root in PowerShell:
+
+```powershell
+# Optional: point at your kit if auto-detect fails
+$env:CMAKE_PREFIX_PATH = "C:\Qt\6.11.3\mingw_64"
+.\run.ps1
+```
+
+| Flag | Action |
+|------|--------|
+| `.\run.ps1` | configure (if needed) + build + run |
+| `.\run.ps1 --rebuild` | wipe `build-win`, then build + run |
+| `.\run.ps1 --run` | run only (exe must exist) |
+| `.\run.ps1 --package` | Release build + `GemSight-win64-Release.zip` |
+
+Env: `BUILD_TYPE`, `QT_INSTALL_DIR`, `GEMSIGHT_QT_KIT`, `FETCHCONTENT_BASE_DIR` (see `.\run.ps1 --help`).
 
 ## GSI
 
