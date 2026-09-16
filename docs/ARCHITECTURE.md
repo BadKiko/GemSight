@@ -6,6 +6,8 @@ Principal blueprint for a native **Qt 6.11+ / QmlMaterial / C++20** desktop comp
 
 **UI lineage:** Mirror proven patterns from [Arachnel](https://github.com/BadKiko/Arachnel) (same author stack): thin QML boundary, `CoreController` façade, `qml/theme/Appearance.qml` token wiring, pinned QmlMaterial FetchContent, `QtConcurrent` / dedicated `QThreadPool` for I/O.
 
+**Platform priority:** **Windows-first** for prototype and MVP. **Display:** second-screen window or lightweight **borderless HUD** — no intrusive in-game overlays, no click-through, no compositor-specific hooks.
+
 ---
 
 ## 1. Platform & build (Qt 6.11+, Arachnel-aligned)
@@ -15,7 +17,7 @@ Principal blueprint for a native **Qt 6.11+ / QmlMaterial / C++20** desktop comp
 | **Qt** | `qt_standard_project_setup(REQUIRES 6.11)`; modules: `Core`, `Gui`, `Network`, `Qml`, `Quick`, `HttpServer` (or `QHttpServer`), `Sql`, `Concurrent` |
 | **C++** | `CMAKE_CXX_STANDARD 20`, `CMAKE_CXX_STANDARD_REQUIRED ON` |
 | **QmlMaterial** | `FetchContent` with **pinned GIT_TAG** (do not float `main` — Arachnel pins after Layouts split broke packaging). Git LFS pull for icon fonts before build. Optional Windows patch cmake for MinGW/static quirks. |
-| **QML layout** | `qml/Main.qml` → `qml/app/AppWindow.qml`; `qml/theme/` (`Appearance.qml`, density tokens); `qml/components/` reusable cards; `qml/draft/` feature screens |
+| **QML layout** | `qml/Main.qml` → `qml/app/SecondScreenWindow.qml` (+ optional `HudWindow.qml`); `qml/theme/` (`Appearance.qml`, density tokens); `qml/components/` reusable cards; `qml/draft/` feature screens |
 | **Import paths** | `engine.addImportPath(appDir + "/qml")`, material path via `QT_QML_MATERIAL_IMPORT_PATH` or baked deploy dir (same as Arachnel `configureQmlEngine`) |
 | **Controls** | Prefer **QmlMaterial** (`import Qcm.Material as MD`); avoid `QtQuick.Controls` in app chrome except where Arachnel uses templates (`QtQuick.Templates` / `MD.ApplicationWindow`) |
 | **High-DPI** | Rely on Qt 6 automatic scaling; set `QGuiApplication::setHighDpiScaleFactorRoundingPolicy(PassThrough)` before `QGuiApplication` construction; drive density via `MD.Token.window_class.select_type(width)` + debounced width handler (Arachnel `AppWindow` pattern); hero/portrait assets as multi-DPI PNG/WebP in `:/icons/` |
@@ -34,6 +36,48 @@ All of the following run **off the GUI thread** (never block `QQuickWindow` rend
 
 Arachnel reference: `catalog_feed_loader.cpp`, `core_wiring_services.cpp` (`QThreadPool` + `QFutureWatcher`).
 
+### Platform strategy & display architecture
+
+#### OS targeting
+
+| Layer | Windows (MVP) | Linux (later) |
+|-------|----------------|---------------|
+| **Priority** | Primary dev, daily dogfood, installer/signing | Port after MVP; no feature fork |
+| **Core (`src/core/**`)** | C++20 + Qt 6.11 modules only | Same sources; `#ifdef` only in `src/platform/` shims if unavoidable |
+| **Forbidden in core** | Win32/X11/Wayland APIs, DWM hooks, global hotkey drivers | — |
+| **Build** | MSVC or MinGW kit; primary CI matrix leg | Add AppImage/flatpak leg when core tests green |
+| **Paths & GSI cfg** | `%Steam%` / install helper copies cfg to Dota `gamestate_integration` | `~/.steam/...` equivalent via `QStandardPaths` + user setting |
+| **Packaging** | Signed `.exe` + optional MSIX (M8) | Deferred |
+
+**Future-proofing rule:** domain logic (GSI, STRATZ, SQLite, draft FSM, timers) lives in **platform-agnostic** TUs. Windows-only code is limited to packaging, optional custom title bar (Arachnel-style), and installer glue under `src/platform/win/`.
+
+#### Display modes (no intrusive overlay)
+
+GemSight is a **normal Qt top-level window** (or a second top-level HUD). It does **not** inject into the Dota swap chain, hook the graphics API, or use OS-specific transparent click-through layers.
+
+| Mode | Purpose | Window profile | MVP |
+|------|---------|----------------|-----|
+| **Second screen (primary)** | Full draft board + advisor on auxiliary monitor | Standard `MD.ApplicationWindow`, resizable, taskbar entry | **Default** |
+| **Borderless HUD (compact)** | Slim timer + lane tip strip beside main monitor | `Qt.FramelessWindowHint \| Qt.WindowStaysOnTopHint`; **opaque** `MD.Card` surface; **full hit-testing** (draggable, clickable) | Optional M6 |
+| **In-game intrusive overlay** | Draw on top of Dota with pass-through clicks | DWM layered windows, X11 `_NET_WM_STATE`, Wayland constraints | **Out of scope** until post-MVP |
+
+**Explicit non-goals (Phase 1–2):** click-through (`WS_EX_TRANSPARENT`, `Qt::WindowTransparentForInput`), per-pixel alpha stacks that behave differently on DWM vs Wayland, global low-level input hooks, and Overwolf-style in-game web overlays.
+
+**Compositor note:** staying off the game framebuffer avoids Windows DWM vs Linux Wayland/X11 divergence; a borderless HUD is still a regular `QQuickWindow` moved with `QWindow::setPosition`, saved per display via `QScreen` + settings.
+
+```mermaid
+flowchart LR
+  subgraph displays["User displays"]
+    Game["Dota 2 fullscreen / borderless"]
+    Aux["GemSight SecondScreenWindow"]
+    HUD["GemSight HudWindow optional"]
+  end
+  Game --- Aux
+  Game --- HUD
+```
+
+`WindowLayoutService` (core, Qt-only): remember screen name, geometry, and mode (`SecondScreen` \| `BorderlessHud`); restore on launch. No platform compositor APIs.
+
 ---
 
 ## 2. Phase 1 — Dota Coach decomposition (summary)
@@ -51,7 +95,7 @@ Arachnel reference: `catalog_feed_loader.cpp`, `core_wiring_services.cpp` (`QThr
 
 | Area | Dota Coach | GemSight |
 |------|------------|----------|
-| Draft intel | Overlay lists | **5-column enemy board** + advisor column |
+| Draft intel | Overlay lists | **Second-screen** 5-column board + advisor column |
 | Voice coaching | Core | **Cut MVP** (visual-first) |
 | Ads / Overwolf | Yes | **Native Qt, no ads** |
 | Timers | Yes | Keep, clock-synced from GSI |
@@ -194,9 +238,11 @@ flowchart TB
   end
 
   subgraph UI["Qt Quick 6.11 + QmlMaterial"]
-    App["AppWindow.qml"]
+    App["SecondScreenWindow.qml"]
+    HUD["HudWindow.qml optional"]
     DraftUI["DraftScreen.qml"]
     Theme["Appearance.qml dark + dense"]
+    Layout["WindowLayoutService"]
   end
 
   CFG --> POST --> GSI
@@ -209,6 +255,8 @@ flowchart TB
   Facade --> Timers
   Draft --> UI
   Theme --> App
+  Layout --> App
+  Layout --> HUD
 ```
 
 ### `CoreController` façade (Arachnel pattern)
@@ -250,7 +298,8 @@ gemsight/
 │   └── gsi/gamestate_integration_gemsight.cfg
 └── qml/
     ├── Main.qml
-    ├── app/AppWindow.qml
+    ├── app/SecondScreenWindow.qml   # primary MD.ApplicationWindow
+    ├── app/HudWindow.qml            # optional compact borderless HUD (M6)
     ├── theme/Appearance.qml
     ├── theme/DraftDensity.qml
     ├── draft/DraftScreen.qml
@@ -269,7 +318,7 @@ gemsight/
 | Player tile | `MD.Card`, `MD.ListItem`, `MD.Badge` |
 | Ban chips | `MD.AssistChip` |
 | WR | `WinrateBar` → `MD.LinearProgressIndicator` |
-| FAB overlay pin | `MD.FloatingActionButton` |
+| Toggle compact HUD | `MD.FloatingActionButton` → show/hide `HudWindow` |
 | Theme | `Appearance.qml` sets `MD.Token.themeMode = MD.Enum.Dark`, monochrome palette for ROSH-like density |
 
 ---
@@ -305,15 +354,16 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ## 8. MVP roadmap (M0–M8) — revised M0–M2
 
-### M0 — Scaffold (Arachnel parity)
+### M0 — Scaffold (Arachnel parity, Windows-first)
 
 - [ ] CMake: Qt **6.11+**, C++20, pinned QmlMaterial + LFS fonts script
 - [ ] `main.cpp`: `configureQmlEngine`, `HighDpiScaleFactorRoundingPolicy::PassThrough`, load `Main` module
-- [ ] `Appearance.qml` dark Material 3 tokens; `AppWindow.qml` empty shell at 60 FPS
+- [ ] `Appearance.qml` dark Material 3 tokens; **`SecondScreenWindow.qml`** empty shell at 60 FPS
 - [ ] `CoreController` singleton registered; no business logic yet
-- [ ] CI smoke: configure + compile (Linux; Windows when available)
+- [ ] **Primary CI / dev loop on Windows** (MSVC); Linux configure-only or secondary job (no Linux-only APIs in `src/core`)
+- [ ] `src/platform/` stub with empty `win/` and `unix/` targets for future shims only
 
-**Exit:** Application window opens; QmlMaterial icons render; zero deprecation warnings at `/W4` or `-Wall`.
+**Exit:** On **Windows**, application window opens on chosen monitor; QmlMaterial icons render; zero deprecation warnings at `/W4` or `-Wall`.
 
 ### M1 — GSI + session phase machine
 
@@ -345,24 +395,35 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ### M5 — Timers
 
-- `TimerEngine` + dock UI.
+- `TimerEngine` + timer strip in `SecondScreenWindow` (and optional sync to HUD).
 
-### M6 — Overlay / second screen
+### M6 — Borderless HUD (optional compact window)
 
-- Frameless `OverlayRoot.qml`.
+- [ ] `HudWindow.qml`: small opaque borderless window (`FramelessWindowHint` + `WindowStaysOnTopHint`); timer + one advisor line
+- [ ] `WindowLayoutService`: save/restore screen + geometry for both windows
+- [ ] **No** click-through, **no** transparency hacks, **no** game injection
+
+**Exit:** User can run full draft on monitor 2 and a draggable HUD on monitor 1 without compositor-specific code.
 
 ### M7 — Party graph + ban suggestions
 
-### M8 — Beta installer
+### M8 — Beta installer (Windows)
+
+- Signed Windows installer; document GSI cfg copy step; Linux packaging backlog item.
+
+### M9 — Linux desktop port (post-MVP)
+
+- Enable full CI build + AppImage; verify Wayland/X11 window placement only (same Qt window flags).
 
 ---
 
-## 9. Overlay vs second screen
+## 9. Display modes reference
 
-| Mode | Flags |
-|------|--------|
-| Second screen | Normal `MD.ApplicationWindow` |
-| Overlay | `Qt.FramelessWindowHint \| Qt.WindowStaysOnTopHint \| Qt.Tool`; opaque `MD.Card` on transparent root |
+| Mode | QML entry | Flags | Input | Cross-platform |
+|------|-----------|-------|-------|----------------|
+| **Second screen** | `SecondScreenWindow.qml` | Default `Qt.Window` | Full | Yes (Qt) |
+| **Borderless HUD** | `HudWindow.qml` | `FramelessWindowHint`, `WindowStaysOnTopHint` | Full (drag handle) | Yes (Qt); test multi-monitor on Windows first |
+| **Intrusive overlay** | — | — | — | **Not planned Phase 1–2** |
 
 ---
 
@@ -375,7 +436,9 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 | Ranked draft | Often blurry compliance | **Explicit IntelGate** |
 | Turbo / NA | Same as ranked UX | **Early enemy STRATZ in ban phase** |
 | Stack | — | **Arachnel-proven QML/Material layout** |
+| Display | In-game Overwolf overlay | **Second screen + optional borderless HUD** |
+| OS | Windows-centric Overwolf | **Windows-first MVP; portable C++20 core** |
 
 ---
 
-*Document version: 2.0 — incorporates Qt 6.11+, C++20-only core, Arachnel UI patterns, and game-mode-aware scouting.*
+*Document version: 2.1 — adds Windows-first platform strategy, second-screen / borderless HUD display model (no intrusive overlay or click-through), and roadmap M6/M8/M9 split.*
