@@ -101,6 +101,9 @@ flowchart LR
 | Timers | Yes | Keep, clock-synced from GSI |
 | Smurf heuristics | Opaque | Explainable score |
 | Pre-draft enemy IDs | Inconsistent UX | **Mode-aware** (see §3) |
+| Role / lane in draft | Absent or guessed | **`RolePredictor`** (STRATZ + pick order) |
+| Live draft WR | Rare | **`DraftEvaluator.liveWinProbability`** |
+| Pick suggestions | Raw counters | **Mastery-weighted `AdvisorController`** |
 
 ### UX pitfalls to avoid
 
@@ -214,9 +217,156 @@ stateDiagram-v2
 
 `IntelGate::mayFetchEnemyProfile(steamId)` implements policy + per-slot unlock flags.
 
+On every transition into **`DraftRefreshing`**, the draft pipeline runs three analytical passes (worker thread), then publishes a single coalesced UI update:
+
+1. **`RolePredictor`** — infer Pos 1–5 per locked hero.
+2. **`DraftEvaluator`** — synergy/advantage rollup + lookahead threats + `liveWinProbability`.
+3. **`AdvisorController`** — mastery-weighted personal pick recommendations (see §5.3).
+
 ---
 
-## 5. End-to-end system architecture
+## 5. Draft intelligence engines (v2.2)
+
+Neither GSI nor raw pick events expose reliable **lane/position** labels during hero select. GemSight derives draft intelligence from **STRATZ matrices + pick-order priors + local player profile**, all off the UI thread.
+
+```mermaid
+flowchart TB
+  Delta[Pick/ban delta] --> RP[RolePredictor]
+  Delta --> DE[DraftEvaluator]
+  Delta --> AC[AdvisorController]
+  Stratz[(STRATZ cache)] --> RP
+  Stratz --> DE
+  Stratz --> AC
+  RP --> Draft[DraftController]
+  DE --> Draft
+  AC --> Draft
+  Draft --> QML[DraftScreen + AdvisorPanel]
+```
+
+| Module | Path | QML surface |
+|--------|------|-------------|
+| Role & position inference | `src/core/draft/role_predictor.{h,cpp}` | Enemy/ally `PlayerCard` position badges |
+| Live draft evaluation & lookahead | `src/core/draft/draft_evaluator.{h,cpp}` | `liveWinProbability`, `DraftBalanceBar`, `LookaheadThreatCard` |
+| Personal pick advisor | `src/core/advisor/advisor_controller.{h,cpp}` | Ranked hero chips + risk warnings |
+
+### 5.1 Dynamic Role & Position Inference (`RolePredictor`)
+
+**Problem:** GSI `draft` and roster events provide hero IDs and slots, not Pos 1–5 or lane assignments.
+
+**Inputs (per team, recomputed on each pick delta):**
+
+| Input | Source |
+|-------|--------|
+| Locked heroes + pick index (1–5 per team) | GSI `draft` / `DraftController` slot map |
+| Per-hero role histogram (Pos 1–5, core vs support) | STRATZ `heroStats` / player `heroes` by `position` (bracket-filtered) |
+| Per-player role affinity | STRATZ enemy/ally profile when `IntelGate` allows |
+| Pick-order stage prior | Heuristic table below |
+
+**Pick-order stage priors (team-relative pick number among revealed picks):**
+
+| Stage | Picks on team (ordinal) | Prior emphasis |
+|-------|-------------------------|----------------|
+| **Stage 1** | 1–2 | Pos **4 / 5** (supports) |
+| **Stage 2** | 3–4 | Pos **3** (offlane), **2** mid/flex |
+| **Stage 3** | 5 (last pick) | Pos **1** carry, **2** hard mid |
+
+**Scoring (per hero → position):**
+
+```text
+score(hero h, position p) =
+    w_hist  * P_stratz(h, p | bracket)
+  + w_order * P_stage(pickIndex, p)
+  + w_player * P_player(steamId, p)   // 0 if ID gated
+```
+
+Default weights: `w_hist=0.45`, `w_order=0.35`, `w_player=0.20` (tunable in settings).
+
+**Assignment:** Build a **5×5 cost matrix** `cost[h_slot][p] = -score(hero, p)` for locked heroes on a team. Solve with **greedy assignment** (sort heroes by pick order, assign each to best remaining position) or **Hungarian / bipartite matching** when all five heroes are locked (exact one-to-one Pos 1–5). Emit `RoleAssignment { teamSlot, heroId, position, confidence }` where `confidence ∈ [0,1]` is normalized margin vs runner-up.
+
+**API (C++):**
+
+- `RolePredictor::update(const DraftSnapshot& snap, const StratzRoleTables& tables)`
+- `QVector<RoleAssignment> assignments(TeamSide side) const`
+- Signal: `assignmentsChanged(TeamSide)`
+
+**Integration:** `DraftController` owns `RolePredictor`; after STRATZ batch refresh, re-run inference; bind to `EnemyTeamModel` / ally model `positionRole` + `positionConfidence`.
+
+### 5.2 Predictive Draft Intelligence & Lookahead (`DraftEvaluator`)
+
+**Live win probability**
+
+After each pick/ban delta, aggregate **all locked heroes** on Radiant vs Dire:
+
+| Term | STRATZ source | Aggregation |
+|------|---------------|-------------|
+| **Synergy** (ally–ally) | Hero pair synergy matrix for bracket | Sum/mean over all ally pairs per team |
+| **Advantage** (counter) | Hero vs hero matchup WR delta | Sum directed edges: our hero vs each revealed enemy |
+
+```text
+teamScore(T) = α * synergy(T) + β * counterEdges(T, opponent)
+liveWinProbability = sigmoid(score(Radiant) - score(Dire))  // map to [0.0, 1.0]
+```
+
+Default `α=0.35`, `β=0.65`. Expose to QML:
+
+- `DraftEvaluator::liveWinProbability` (`double`, `NOTIFY liveWinProbabilityChanged`)
+- Optional `radiantEdge` / `direEdge` for `DraftBalanceBar` gradient (0.5 = even).
+
+Recompute on worker thread; debounce with draft UI (50 ms).
+
+**Lookahead enemy threat scanner**
+
+1. **Infer missing enemy roles** via `RolePredictor` on *hypothetical* completion: which Pos 1–5 slots on enemy team have no hero yet.
+2. **Candidate pool:** top meta heroes for each missing role from STRATZ bracket `heroStats` (pick rate × WR).
+3. **Counter-threat rank:** for each candidate `h`, score  
+   `threat(h) = Σ counterAdvantage(h, ourRevealedHero_i)` across our locked roster.
+4. **ScoutEarly boost:** when enemy `steamId` known for the slot likely to fill a missing role, multiply candidates by `signatureWeight(steamId, h)` from that player’s top heroes (`player.heroes`).
+5. Emit **top 3** `LookaheadThreat { heroId, role, threatScore, reason }` for `LookaheadThreatCard.qml`.
+
+**API (C++):**
+
+- `DraftEvaluator::evaluate(const DraftSnapshot&, const RolePredictor&, const StratzMatrices&)`
+- `Q_PROPERTY(double liveWinProbability ...)`
+- `QAbstractListModel* lookaheadThreats()`
+
+### 5.3 Personal Pick Advisor — Mastery-Weighted Counter-Pick (`AdvisorController`)
+
+**Core problem:** Tools that rank only by **matchup WR delta** recommend +10% “paper counters” with **0 lifetime games**, which loses matches. GemSight ranks by **comfort + matchup**.
+
+**Scope:** Local player (`GSI player.steamid` / settings) picking for **their** role (from `RolePredictor` on ally team + user preference override).
+
+**Composite score:**
+
+```text
+Score(h) = (MatchupAdvantage(h) * W_matchup) + (PersonalMastery(h) * W_mastery)
+
+MatchupAdvantage(h) = Σ_{e ∈ revealedEnemies} counterDelta(h, e)   // STRATZ matrix, bracket
+PersonalMastery(h)  = f(games_total, games_30d, winrate_player)   // STRATZ local player profile
+```
+
+Suggested defaults: `W_matchup=0.55`, `W_mastery=0.45`. `f` is normalized to `[0,1]` with soft cap (e.g. mastery saturates ~300 games).
+
+**Recommendation hierarchy & UI chips (`MD.AssistChip` / advisor list):**
+
+| Rank | Condition | Chip copy (RU / i18n key) |
+|------|-----------|---------------------------|
+| **Rank 1 — Recommended** | High mastery **and** `MatchupAdvantage ≥ 0` | «Рекомендуется: комфортный сигнатурный пик с плюсом в драфте» |
+| **Rank 2 — Viable** | High mastery **and** mild negative matchup (e.g. −1.5%) | «Играбельно: лёгкий минус в матчапе, но высокий опыт на герое» |
+| **Warning — Meta only** | High advantage **and** `games_total == 0` (or &lt; threshold) | «Мета-контрпик: осторожно — герой не отыгран» |
+| **Warning — High risk** | Signature hero **and** strong negative matchup (e.g. ≤ −8%) | «Высокий риск: сильные контрпики врага» |
+
+**Anti-trap rule:** When sorting candidates, never let a **0-game** hero outrank a **signature** pick with positive or mildly negative matchup unless user enables “Aggressive meta” in settings.
+
+**Outputs:**
+
+- `QAbstractListModel* pickRecommendations()` — roles: `heroId`, `score`, `tier` (Recommended/Viable/Warning), `message`, `matchupAdvantage`, `mastery`
+- Invoked from `DraftController` on each `DraftRefreshing` pass after matrices load.
+
+**M4 deliverable:** wire to STRATZ; until then stub with deterministic demo rows tied to `simulateTurboDraft()`.
+
+---
+
+## 6. End-to-end system architecture
 
 ```mermaid
 flowchart TB
@@ -230,6 +380,9 @@ flowchart TB
     GSI["GsiServer"]
     Session["MatchSessionController"]
     Draft["DraftController"]
+    RP["RolePredictor"]
+    DE["DraftEvaluator"]
+    Adv["AdvisorController"]
     Gate["IntelGate / GameModePolicy"]
     Stratz["StratzGraphqlClient"]
     Cache["SqliteCache + LRU"]
@@ -249,11 +402,20 @@ flowchart TB
   GSI --> Session
   Session --> Draft
   Draft --> Gate
+  Draft --> RP
+  Draft --> DE
+  Draft --> Adv
   Gate --> Stratz
   Stratz --> Rate --> Cache
+  Cache --> RP
+  Cache --> DE
+  Cache --> Adv
   Facade --> Draft
+  Facade --> Adv
   Facade --> Timers
   Draft --> UI
+  DE --> UI
+  Adv --> UI
   Theme --> App
   Layout --> App
   Layout --> HUD
@@ -263,16 +425,16 @@ flowchart TB
 
 Single QML singleton `GemSight.Core` exposing:
 
-- `DraftController* draft`
-- `AdvisorController* advisor`
+- `DraftController* draft` — owns `RolePredictor` + `DraftEvaluator` sub-objects (or injects shared instances)
+- `AdvisorController* advisor` — mastery-weighted pick list + lane/item adjunct (M4+)
 - `TimerController* timers`
-- `SettingsStore* settings`
+- `SettingsStore* settings` — includes `W_matchup`, `W_mastery`, advisor aggressiveness
 
-Heavy logic stays in `src/core/**`; façade only forwards signals and registered models (`QAbstractListModel` for enemy columns).
+Heavy logic stays in `src/core/**`; façade only forwards signals and registered models (`QAbstractListModel` for enemy columns, threats, recommendations).
 
 ---
 
-## 6. QML architecture (file tree)
+## 7. QML architecture (file tree)
 
 ```text
 gemsight/
@@ -286,8 +448,11 @@ gemsight/
 │   │   ├── gsi/gsi_server.{h,cpp}
 │   │   ├── session/match_session_controller.{h,cpp}
 │   │   ├── draft/draft_controller.{h,cpp}
+│   │   ├── draft/role_predictor.{h,cpp}
+│   │   ├── draft/draft_evaluator.{h,cpp}
 │   │   ├── draft/intel_gate.{h,cpp}
 │   │   ├── draft/game_mode_policy.{h,cpp}
+│   │   ├── advisor/advisor_controller.{h,cpp}
 │   │   ├── stratz/stratz_client.{h,cpp}
 │   │   ├── cache/sqlite_cache.{h,cpp}
 │   │   └── timers/timer_engine.{h,cpp}
@@ -303,10 +468,13 @@ gemsight/
     ├── theme/Appearance.qml
     ├── theme/DraftDensity.qml
     ├── draft/DraftScreen.qml
+    ├── draft/DraftBalanceBar.qml   # liveWinProbability gradient
+    ├── draft/LookaheadThreatCard.qml
     ├── draft/EnemyColumn.qml
-    ├── draft/PlayerCard.qml      # MD.Card
-    ├── draft/WinrateBar.qml      # MD.LinearProgressIndicator
-    ├── advisor/MatchupPanel.qml
+    ├── draft/PlayerCard.qml      # MD.Card + position badge
+    ├── draft/WinrateBar.qml      # MD.LinearIndicator
+    ├── advisor/MatchupPanel.qml  # pick chips + warnings
+    ├── advisor/PickRecommendationChip.qml
     └── components/AppSnackbar.qml
 ```
 
@@ -317,13 +485,18 @@ gemsight/
 | Shell | `MD.ApplicationWindow`, `MD.MProp.*` colors |
 | Player tile | `MD.Card`, `MD.ListItem`, `MD.Badge` |
 | Ban chips | `MD.AssistChip` |
-| WR | `WinrateBar` → `MD.LinearProgressIndicator` |
+| WR | `WinrateBar` → `MD.LinearIndicator` |
+| Draft balance | `DraftBalanceBar` — `liveWinProbability` centered at 0.5 |
+| Lookahead threats | `LookaheadThreatCard` — top-3 enemy draft threats |
+| Pick advisor | `PickRecommendationChip` — tier color + `MD.AssistChip` |
 | Toggle compact HUD | `MD.FloatingActionButton` → show/hide `HudWindow` |
 | Theme | `Appearance.qml` sets `MD.Token.themeMode = MD.Enum.Dark`, monochrome palette for ROSH-like density |
 
+`SecondScreenWindow`: place `DraftBalanceBar` under draft header; stack `LookaheadThreatCard` above advisor column.
+
 ---
 
-## 7. STRATZ GraphQL batching
+## 8. STRATZ GraphQL batching
 
 **Endpoint:** `POST https://api.stratz.com/graphql`  
 **Headers:** `Authorization: Bearer <token>`, `User-Agent: STRATZ_API`
@@ -352,7 +525,7 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ---
 
-## 8. MVP roadmap (M0–M8) — revised M0–M2
+## 9. MVP roadmap (M0–M9)
 
 ### M0 — Scaffold (Arachnel parity, Windows-first)
 
@@ -375,23 +548,36 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 **Exit:** Entering Turbo/unranked draft logs `ScoutEarly`; ranked logs `ScoutRanked`.
 
-### M2 — Draft UI + mode-aware intel gate
+### M2 — Draft UI + mode-aware intel gate + inference stubs
 
 - [ ] `DraftScreen`: 5× `EnemyColumn` + ally strip; bound to GSI draft hero IDs
 - [ ] `IntelGate` + `DraftController` state machine (§4)
 - [ ] **ScoutEarly:** trigger `StratzBatchJob` on ban phase when enemy IDs present (stub client OK)
 - [ ] **ScoutRanked:** teammate batch live; enemy cards show meta-only until unlock signal
+- [ ] **`RolePredictor` stub:** pick-order priors only; position badges on cards (low confidence until M3)
+- [ ] **`DraftEvaluator` stub:** `liveWinProbability` from pick count / demo formula; empty `LookaheadThreatCard` placeholder
+- [ ] **`DraftBalanceBar.qml`** bound to `DraftEvaluator.liveWinProbability`
 - [ ] Debounced model updates on GUI thread
 
-**Exit:** Turbo lobby shows enemy column “loading → profile” during bans; ranked shows teammate intel early and enemy profiles only after strategy/pick lock.
+**Exit:** Turbo lobby shows enemy column “loading → profile” during bans; ranked shows teammate intel early and enemy profiles only after strategy/pick lock; balance bar moves on demo draft.
 
-### M3 — STRATZ + SQLite
+### M3 — STRATZ + SQLite + role tables
 
-- Token in settings; real batch query; cache by `(steamId, patch)`.
+- [ ] Token in settings; real batch query; cache by `(steamId, patch)`
+- [ ] Preload bracket **hero role histograms**, **pair synergy**, **vs matchup** matrices into SQLite
+- [ ] **`RolePredictor` v1:** STRATZ hist + pick-order priors + greedy/bipartite assignment; confidence on UI badges
 
-### M4 — Advisor v1
+**Exit:** Position labels on draft cards match plausible roles for revealed picks.
 
-- JSON starter builds + lane modifier rules.
+### M4 — Advisor + evaluator production
+
+- [ ] **`DraftEvaluator` v1:** synergy + advantage rollup; real `liveWinProbability`; **lookahead top-3** threats with ScoutEarly signature weighting
+- [ ] **`LookaheadThreatCard.qml`** populated from `lookaheadThreats` model
+- [ ] **`AdvisorController`:** mastery-weighted counter-pick (`Score = W_m * Matchup + W_mast * Mastery`); chip tiers + warnings (§5.3)
+- [ ] **`PickRecommendationChip.qml`** in advisor column
+- [ ] JSON starter builds + lane modifier rules (in-game advisor adjunct)
+
+**Exit:** Personal pick list never promotes 0-game “paper counters” above signature comfort picks; balance bar and threat card update each pick in demo/real draft.
 
 ### M5 — Timers
 
@@ -417,7 +603,7 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ---
 
-## 9. Display modes reference
+## 10. Display modes reference
 
 | Mode | QML entry | Flags | Input | Cross-platform |
 |------|-----------|-------|-------|----------------|
@@ -427,7 +613,7 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ---
 
-## 10. Positioning vs Dota Coach
+## 11. Positioning vs Dota Coach
 
 | Dimension | Dota Coach | GemSight |
 |-----------|------------|----------|
@@ -441,4 +627,4 @@ Validate fragments against [GraphiQL](https://api.stratz.com/graphiql/). Rate li
 
 ---
 
-*Document version: 2.1 — adds Windows-first platform strategy, second-screen / borderless HUD display model (no intrusive overlay or click-through), and roadmap M6/M8/M9 split.*
+*Document version: 2.2 — adds `RolePredictor`, `DraftEvaluator` (live WR + lookahead threats), mastery-weighted `AdvisorController`, QML `DraftBalanceBar` / `LookaheadThreatCard`, and M2/M3/M4 milestone split.*
