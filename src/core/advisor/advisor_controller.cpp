@@ -1,5 +1,7 @@
 #include "core/advisor/advisor_controller.h"
 
+#include "core/heroes/hero_catalog.h"
+
 #include <algorithm>
 
 namespace gemsight::core {
@@ -69,9 +71,25 @@ void AdvisorController::loadDemoRecommendations()
 {
     QVector<PickRecommendationRow> rows;
 
-    rows.push_back({
+    auto rowFor = [](int heroId, double score, PickTier tier, const QString& msg, double matchup, double mastery,
+                      int games, int games30d, bool signature) {
+        PickRecommendationRow row;
+        row.heroId = heroId;
+        row.heroName = HeroCatalog::displayName(heroId);
+        row.heroPortraitUrl = HeroCatalog::portraitUrl(heroId);
+        row.score = score;
+        row.tier = tier;
+        row.message = msg;
+        row.matchupAdvantage = matchup;
+        row.personalMastery = mastery;
+        row.gamesTotal = games;
+        row.games30d = games30d;
+        row.isSignature = signature;
+        return row;
+    };
+
+    rows.push_back(rowFor(
         110,
-        tr("Феникс"),
         0.91,
         PickTier::Recommended,
         tr("Рекомендуется: комфортный сигнатурный пик с плюсом в драфте"),
@@ -79,11 +97,9 @@ void AdvisorController::loadDemoRecommendations()
         0.78,
         1240,
         42,
-        true,
-    });
-    rows.push_back({
+        true));
+    rows.push_back(rowFor(
         76,
-        tr("Outworld Destroyer"),
         0.84,
         PickTier::Viable,
         tr("Играбельно: лёгкий минус в матчапе, но сильный опыт на герое"),
@@ -91,11 +107,9 @@ void AdvisorController::loadDemoRecommendations()
         0.71,
         890,
         28,
-        true,
-    });
-    rows.push_back({
+        true));
+    rows.push_back(rowFor(
         16,
-        tr("Sand King"),
         0.62,
         PickTier::Neutral,
         tr("Нейтральный вариант по сумме матчапа и опыта"),
@@ -103,11 +117,9 @@ void AdvisorController::loadDemoRecommendations()
         0.41,
         210,
         9,
-        false,
-    });
-    rows.push_back({
+        false));
+    rows.push_back(rowFor(
         53,
-        tr("Nature's Prophet"),
         0.58,
         PickTier::WarningHighRisk,
         tr("Высокий риск: сильные контрпики врага на сигнатуру"),
@@ -115,11 +127,9 @@ void AdvisorController::loadDemoRecommendations()
         0.69,
         760,
         15,
-        true,
-    });
-    rows.push_back({
+        true));
+    rows.push_back(rowFor(
         39,
-        tr("Queen of Pain"),
         0.55,
         PickTier::WarningMetaOnly,
         tr("Мета-контрпик: осторожно — герой не отыгран"),
@@ -127,8 +137,7 @@ void AdvisorController::loadDemoRecommendations()
         0.12,
         18,
         2,
-        false,
-    });
+        false));
 
     sortRecommendations(rows);
     if (rows.size() > 8)

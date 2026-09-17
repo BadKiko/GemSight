@@ -3,6 +3,8 @@ import QtQuick.Layouts
 
 import Qcm.Material as MD
 
+import "../components"
+
 Item {
     id: root
 
@@ -11,6 +13,7 @@ Item {
     required property string message
     required property double matchupAdvantage
     required property int gamesTotal
+    required property string heroPortraitUrl
 
     implicitWidth: column.implicitWidth
     implicitHeight: column.implicitHeight
@@ -35,36 +38,48 @@ Item {
         }
     }
 
-    ColumnLayout {
+    RowLayout {
         id: column
         width: parent.width
-        spacing: MD.Token.spacing.extra_small
+        spacing: MD.Token.spacing.small
 
-        MD.AssistChip {
-            Layout.fillWidth: true
-            text: root.heroName
-            MD.MProp.backgroundColor: root.chipBg
-            MD.MProp.textColor: root.chipFg
+        HeroPortrait {
+            Layout.preferredWidth: 64
+            Layout.preferredHeight: 36
+            source: root.heroPortraitUrl
+            fallbackText: root.heroName.charAt(0)
         }
 
-        MD.Label {
+        ColumnLayout {
             Layout.fillWidth: true
-            text: root.message
-            typescale: MD.Token.typescale.body_small
-            color: MD.MProp.color.on_surface_variant
-            wrapMode: Text.WordWrap
-            maximumLineCount: 3
-        }
+            spacing: MD.Token.spacing.extra_small
 
-        MD.Label {
-            Layout.fillWidth: true
-            text: {
-                const pct = (Math.round(root.matchupAdvantage * 10) / 10)
-                const sign = pct > 0 ? "+" : ""
-                return sign + pct + "% · " + root.gamesTotal + " " + qsTr("игр")
+            MD.AssistChip {
+                Layout.fillWidth: true
+                text: root.heroName
+                MD.MProp.backgroundColor: root.chipBg
+                MD.MProp.textColor: root.chipFg
             }
-            typescale: MD.Token.typescale.label_small
-            color: MD.MProp.color.outline
+
+            MD.Label {
+                Layout.fillWidth: true
+                text: root.message
+                typescale: MD.Token.typescale.body_small
+                color: MD.MProp.color.on_surface_variant
+                wrapMode: Text.WordWrap
+                maximumLineCount: 3
+            }
+
+            MD.Label {
+                Layout.fillWidth: true
+                text: {
+                    const pct = (Math.round(root.matchupAdvantage * 10) / 10)
+                    const sign = pct > 0 ? "+" : ""
+                    return sign + pct + "% · " + root.gamesTotal + " " + qsTr("игр")
+                }
+                typescale: MD.Token.typescale.label_small
+                color: MD.MProp.color.outline
+            }
         }
     }
 }

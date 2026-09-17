@@ -12,6 +12,7 @@ struct RoleGuess {
 class RolePredictor {
 public:
     static RoleGuess guessForPickOrder(int pickIndex);
+    static RoleGuess guessForHero(int heroId, int pickIndex);
 };
 
 } // namespace gemsight::core

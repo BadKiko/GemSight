@@ -17,6 +17,7 @@ struct PickRecommendationRow {
     int gamesTotal = 0;
     int games30d = 0;
     bool isSignature = false;
+    QString heroPortraitUrl;
 };
 
 class PickRecommendationModel : public QAbstractListModel {
@@ -33,6 +34,7 @@ public:
         GamesTotalRole,
         Games30dRole,
         IsSignatureRole,
+        HeroPortraitUrlRole,
     };
     Q_ENUM(Roles)
 

@@ -1,5 +1,7 @@
 #include "core/draft/draft_evaluator.h"
 
+#include "core/heroes/hero_catalog.h"
+
 namespace gemsight::core {
 
 DraftEvaluator::DraftEvaluator(QObject* parent)
@@ -11,10 +13,34 @@ DraftEvaluator::DraftEvaluator(QObject* parent)
 void DraftEvaluator::reset()
 {
     setWinProbability(0.5);
+    m_threats.resetRows({});
     if (m_hint != QString()) {
         m_hint.clear();
         emit balanceHintChanged();
     }
+}
+
+void DraftEvaluator::loadDemoThreats()
+{
+    QVector<gemsight::LookaheadThreatRow> rows;
+    const QList<int> ids = {39, 53, 76};
+    const QList<QString> reasons = {
+        tr("Сигнатура врага · сильный мид"),
+        tr("Давление линий · глобальный герой"),
+        tr("Контрпик по вашему пулу (демо)"),
+    };
+    const QList<double> scores = {0.82, 0.74, 0.68};
+
+    for (int i = 0; i < ids.size(); ++i) {
+        gemsight::LookaheadThreatRow row;
+        row.heroId = ids.at(i);
+        row.heroName = HeroCatalog::displayName(ids.at(i));
+        row.heroPortraitUrl = HeroCatalog::portraitUrl(ids.at(i));
+        row.reason = reasons.at(i);
+        row.threatScore = scores.at(i);
+        rows.push_back(row);
+    }
+    m_threats.resetRows(rows);
 }
 
 void DraftEvaluator::onEnemyPicksRevealed(int count)

@@ -1,7 +1,9 @@
 #pragma once
 
+#include "core/cache/intel_cache.h"
 #include "core/draft/draft_evaluator.h"
 #include "core/draft/intel_gate.h"
+#include "core/intel/player_intel_fetcher.h"
 #include "models/enemy_team_model.h"
 #include "models/ally_team_model.h"
 
@@ -52,13 +54,17 @@ private:
     void onStrategyTime();
     void scheduleStratzStub(int teamSlot, qint64 steamId);
     void applyRoleGuess(gemsight::EnemySlot& slot);
+    void decorateHeroVisuals(gemsight::EnemySlot& slot, int heroId);
     void refreshEvaluatorFromEnemies();
     void populateDemoAllies();
 
     gemsight::EnemyTeamModel m_enemies;
     gemsight::AllyTeamModel m_allies;
+    IntelCache m_intelCache;
+    PlayerIntelFetcher m_intelFetcher;
     IntelGate m_gate;
     DraftEvaluator m_evaluator;
+    QString m_activePatch = QStringLiteral("current");
     class AdvisorController* m_advisor = nullptr;
     MatchSessionController* m_session = nullptr;
     GsiServer* m_gsi = nullptr;

@@ -15,6 +15,8 @@ struct EnemySlot {
     qint64 steamId = 0;
     QString roleLabel;
     double roleConfidence = 0.0;
+    QString avatarUrl;
+    QString heroPortraitUrl;
 };
 
 class EnemyTeamModel : public QAbstractListModel {
@@ -31,6 +33,8 @@ public:
         SteamIdRole,
         RoleLabelRole,
         RoleConfidenceRole,
+        AvatarUrlRole,
+        HeroPortraitUrlRole,
     };
     Q_ENUM(Roles)
 

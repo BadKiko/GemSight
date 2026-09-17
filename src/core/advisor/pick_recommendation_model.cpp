@@ -41,6 +41,8 @@ QVariant PickRecommendationModel::data(const QModelIndex& index, int role) const
         return row.games30d;
     case IsSignatureRole:
         return row.isSignature;
+    case HeroPortraitUrlRole:
+        return row.heroPortraitUrl;
     default:
         return {};
     }
@@ -59,6 +61,7 @@ QHash<int, QByteArray> PickRecommendationModel::roleNames() const
         {GamesTotalRole, "gamesTotal"},
         {Games30dRole, "games30d"},
         {IsSignatureRole, "isSignature"},
+        {HeroPortraitUrlRole, "heroPortraitUrl"},
     };
 }
 

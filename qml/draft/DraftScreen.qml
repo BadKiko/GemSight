@@ -50,8 +50,10 @@ Item {
                         required property bool profileUnlocked
                         required property string roleLabel
                         required property double roleConfidence
+                        required property string avatarUrl
+                        required property string heroPortraitUrl
 
-                        width: Math.max(160, (enemyList.width - 4 * enemyList.spacing) / 5)
+                        width: Math.max(168, (enemyList.width - 4 * enemyList.spacing) / 5)
                         height: enemyList.height
                         slotIndex: teamSlot
                         displayHero: heroName
@@ -61,6 +63,8 @@ Item {
                         profileOpen: profileUnlocked
                         roleLabel: roleLabel
                         roleConfidence: roleConfidence
+                        avatarUrl: avatarUrl
+                        heroPortraitUrl: heroPortraitUrl
                     }
                 }
             }
@@ -97,8 +101,10 @@ Item {
                     required property bool profileUnlocked
                     required property string roleLabel
                     required property double roleConfidence
+                    required property string avatarUrl
+                    required property string heroPortraitUrl
 
-                    width: Math.max(140, (allyList.width - 4 * allyList.spacing) / 5)
+                    width: Math.max(168, (allyList.width - 4 * allyList.spacing) / 5)
                     height: allyList.height
                     slotIndex: teamSlot
                     displayHero: heroName
@@ -108,6 +114,8 @@ Item {
                     profileOpen: profileUnlocked
                     roleLabel: roleLabel
                     roleConfidence: roleConfidence
+                    avatarUrl: avatarUrl
+                    heroPortraitUrl: heroPortraitUrl
                 }
             }
         }

@@ -2,6 +2,7 @@
 
 #include "core/advisor/advisor_controller.h"
 #include "core/draft/role_predictor.h"
+#include "core/heroes/hero_catalog.h"
 #include "core/gsi/gsi_server.h"
 #include "core/session/match_session_controller.h"
 
@@ -13,6 +14,7 @@ namespace gemsight::core {
 DraftController::DraftController(QObject* parent)
     : QObject(parent)
 {
+    m_intelCache.open();
     m_debounce.setInterval(50);
     m_debounce.setSingleShot(true);
     connect(&m_debounce, &QTimer::timeout, this, [this]() {
@@ -74,6 +76,7 @@ void DraftController::simulateTurboDraft()
     populateDemoAllies();
     if (m_advisor)
         m_advisor->loadDemoRecommendations();
+    m_evaluator.loadDemoThreats();
     setStatus(tr("Демо: Turbo, разведка врагов в фазе банов"));
 }
 
@@ -103,6 +106,7 @@ void DraftController::onHeroPicked(int teamSlot, int heroId, const QString& hero
     slot.heroId = heroId;
     slot.heroName = heroName;
     slot.statusText = tr("Герой выбран");
+    decorateHeroVisuals(slot, heroId);
     applyRoleGuess(slot);
     m_enemies.updateSlot(teamSlot, slot);
     refreshEvaluatorFromEnemies();
@@ -148,30 +152,77 @@ void DraftController::onStrategyTime()
 
 void DraftController::scheduleStratzStub(int teamSlot, qint64 steamId)
 {
+    const QString cachedAvatar = m_intelCache.avatarUrl(steamId, m_activePatch);
+    if (!cachedAvatar.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this, teamSlot, steamId, cachedAvatar]() {
+            gemsight::EnemySlot slot;
+            const QModelIndex idx = m_enemies.index(teamSlot);
+            slot.teamSlot = teamSlot;
+            slot.steamId = steamId;
+            slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
+            slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
+            slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
+            slot.playerName = m_enemies.data(idx, gemsight::EnemyTeamModel::PlayerNameRole).toString();
+            slot.avatarUrl = cachedAvatar;
+            slot.profileUnlocked = true;
+            slot.winRate = 0.52 + (teamSlot * 0.01);
+            slot.statusText = tr("Кэш SQLite");
+            applyRoleGuess(slot);
+            m_enemies.updateSlot(teamSlot, slot);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     QtConcurrent::run([this, teamSlot, steamId]() {
-        QThread::msleep(400);
+        QThread::msleep(250);
+
+        QString avatarUrl;
+        QString displayName;
+        const PlayerIntelResult intel = m_intelFetcher.fetchAvatarOpenDota(steamId);
+        if (intel.ok) {
+            avatarUrl = intel.avatarUrl;
+            displayName = intel.displayName;
+        }
+
         QMetaObject::invokeMethod(
             this,
-            [this, teamSlot, steamId]() {
+            [this, teamSlot, steamId, avatarUrl, displayName]() {
+                if (!avatarUrl.isEmpty())
+                    m_intelCache.putPlayerProfile(steamId, m_activePatch, avatarUrl, QString());
                 gemsight::EnemySlot slot;
                 const QModelIndex idx = m_enemies.index(teamSlot);
                 slot.teamSlot = teamSlot;
                 slot.steamId = steamId;
                 slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
                 slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
+                slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
                 slot.playerName = m_enemies.data(idx, gemsight::EnemyTeamModel::PlayerNameRole).toString();
+                if (!displayName.isEmpty())
+                    slot.playerName = displayName;
+                slot.avatarUrl = avatarUrl;
                 slot.profileUnlocked = true;
                 slot.winRate = 0.52 + (teamSlot * 0.01);
-                slot.statusText = tr("Кэш / демо-данные");
+                slot.statusText = avatarUrl.isEmpty() ? tr("Профиль (без аватара)") : tr("OpenDota / кэш");
+                applyRoleGuess(slot);
                 m_enemies.updateSlot(teamSlot, slot);
             },
             Qt::QueuedConnection);
     });
 }
 
+void DraftController::decorateHeroVisuals(gemsight::EnemySlot& slot, int heroId)
+{
+    if (heroId <= 0)
+        return;
+    slot.heroId = heroId;
+    slot.heroName = HeroCatalog::displayName(heroId);
+    slot.heroPortraitUrl = HeroCatalog::portraitUrl(heroId);
+}
+
 void DraftController::applyRoleGuess(gemsight::EnemySlot& slot)
 {
-    const RoleGuess guess = RolePredictor::guessForPickOrder(slot.teamSlot);
+    const RoleGuess guess = slot.heroId > 0 ? RolePredictor::guessForHero(slot.heroId, slot.teamSlot)
+                                            : RolePredictor::guessForPickOrder(slot.teamSlot);
     slot.roleLabel = guess.label;
     slot.roleConfidence = guess.confidence;
 }
@@ -189,18 +240,11 @@ void DraftController::refreshEvaluatorFromEnemies()
 
 void DraftController::populateDemoAllies()
 {
-    const QList<QString> heroes = {
-        tr("Pudge"),
-        tr("Crystal Maiden"),
-        tr("Juggernaut"),
-        tr("Rubick"),
-        tr("Lion"),
-    };
+    const QList<int> heroIds = {14, 5, 8, 86, 26};
     for (int i = 0; i < 5; ++i) {
         gemsight::EnemySlot slot;
         slot.teamSlot = i;
-        slot.heroName = heroes.at(i);
-        slot.heroId = 100 + i;
+        decorateHeroVisuals(slot, heroIds.at(i));
         slot.playerName = tr("Союзник %1").arg(i + 1);
         slot.profileUnlocked = true;
         slot.statusText = tr("Пик союзника");
