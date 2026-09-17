@@ -3,10 +3,16 @@
 #include "core/settings/settings_store.h"
 
 #include <QDir>
+#include <QFile>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlError>
 #include <QStyleHints>
+
+#ifdef QML_MATERIAL_STATIC_DEFINE
+#include <QtPlugin>
+Q_IMPORT_PLUGIN(Qcm_MaterialPlugin)
+#endif
 
 #ifndef QT_QML_MATERIAL_IMPORT_PATH
 #define QT_QML_MATERIAL_IMPORT_PATH ""
@@ -14,11 +20,39 @@
 
 namespace {
 
+bool qmlMaterialPluginDllExists(const QString& importRoot)
+{
+    const QString dir = importRoot + QStringLiteral("/Qcm/Material/");
+    const QStringList names = {
+#ifdef Q_OS_WIN
+        QStringLiteral("qml_materialplugin.dll"),
+        QStringLiteral("libqml_materialplugin.dll"),
+#else
+        QStringLiteral("libqml_materialplugin.so"),
+        QStringLiteral("qml_materialplugin.so"),
+        QStringLiteral("libqml_materialplugin.dylib"),
+#endif
+    };
+    for (const QString& name : names) {
+        if (QFile::exists(dir + name))
+            return true;
+    }
+    return false;
+}
+
+void addMaterialImportPath(QQmlApplicationEngine& engine, const QString& path)
+{
+    if (path.isEmpty())
+        return;
+    if (qmlMaterialPluginDllExists(path))
+        engine.addImportPath(path);
+}
+
 void configureQmlEngine(QQmlApplicationEngine& engine)
 {
     const QString appDir = QCoreApplication::applicationDirPath();
     engine.addImportPath(appDir + QStringLiteral("/qml"));
-    engine.addImportPath(appDir + QStringLiteral("/qml_modules"));
+    addMaterialImportPath(engine, appDir + QStringLiteral("/qml_modules"));
 
     const QByteArray materialPathEnv = qgetenv("QT_QML_MATERIAL_IMPORT_PATH");
     const QString materialPath = materialPathEnv.isEmpty()
@@ -28,7 +62,7 @@ void configureQmlEngine(QQmlApplicationEngine& engine)
         const QString resolved = QDir::isAbsolutePath(materialPath)
             ? materialPath
             : (appDir + QLatin1Char('/') + materialPath);
-        engine.addImportPath(resolved);
+        addMaterialImportPath(engine, resolved);
     }
 }
 
@@ -75,6 +109,8 @@ int main(int argc, char* argv[])
         Qt::QueuedConnection);
 
     engine.loadFromModule(QStringLiteral("gemsight"), QStringLiteral("Main"));
+    if (engine.rootObjects().isEmpty())
+        return 1;
 
     core.draft()->startGsi();
 

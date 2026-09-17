@@ -98,6 +98,7 @@ target_link_libraries(gemsight_app
         Qt6::HttpServer
         Qt6::Sql
         qml_material::qml_material
+        qml_materialplugin
 )
 
 qt_import_qml_plugins(gemsight_app)

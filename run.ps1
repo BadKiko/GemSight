@@ -823,14 +823,14 @@ function Show-CrashReport {
     Write-Host "Logs:      $dataDir"
     Write-Host ""
 
-    $crashTail = Get-LogTail $crashLog 20
+    $crashTail = @(Get-LogTail $crashLog 20)
     if ($crashTail.Count -gt 0) {
         Write-Host "--- crash.log (last lines) ---" -ForegroundColor Yellow
         $crashTail | ForEach-Object { Write-Host $_ }
         Write-Host ""
     }
 
-    $runTail = Get-LogTail $runLog 30
+    $runTail = @(Get-LogTail $runLog 30)
     if ($runTail.Count -gt 0) {
         Write-Host "--- run.log (last lines) ---" -ForegroundColor Yellow
         $runTail | ForEach-Object { Write-Host $_ }
