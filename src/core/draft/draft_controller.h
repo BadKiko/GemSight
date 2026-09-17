@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/draft/draft_evaluator.h"
 #include "core/draft/intel_gate.h"
 #include "models/enemy_team_model.h"
 #include "models/ally_team_model.h"
@@ -19,6 +20,7 @@ class DraftController : public QObject {
     Q_PROPERTY(QString policyLabel READ policyLabel NOTIFY policyLabelChanged)
     Q_PROPERTY(QString statusLine READ statusLine NOTIFY statusLineChanged)
     Q_PROPERTY(bool gsiListening READ gsiListening NOTIFY gsiListeningChanged)
+    Q_PROPERTY(gemsight::core::DraftEvaluator* evaluator READ evaluator CONSTANT)
 
 public:
     explicit DraftController(QObject* parent = nullptr);
@@ -28,8 +30,10 @@ public:
     QString policyLabel() const { return m_policyLabel; }
     QString statusLine() const { return m_statusLine; }
     bool gsiListening() const;
+    DraftEvaluator* evaluator() { return &m_evaluator; }
 
     void bindSession(MatchSessionController* session);
+    void bindAdvisor(class AdvisorController* advisor);
     void bindGsi(GsiServer* gsi);
 
     Q_INVOKABLE void startGsi();
@@ -47,10 +51,15 @@ private:
     void onEnemySteam(int teamSlot, qint64 steamId, const QString& name);
     void onStrategyTime();
     void scheduleStratzStub(int teamSlot, qint64 steamId);
+    void applyRoleGuess(gemsight::EnemySlot& slot);
+    void refreshEvaluatorFromEnemies();
+    void populateDemoAllies();
 
     gemsight::EnemyTeamModel m_enemies;
     gemsight::AllyTeamModel m_allies;
     IntelGate m_gate;
+    DraftEvaluator m_evaluator;
+    class AdvisorController* m_advisor = nullptr;
     MatchSessionController* m_session = nullptr;
     GsiServer* m_gsi = nullptr;
     QString m_policyLabel;

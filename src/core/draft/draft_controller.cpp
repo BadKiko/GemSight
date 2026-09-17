@@ -1,5 +1,7 @@
 #include "core/draft/draft_controller.h"
 
+#include "core/advisor/advisor_controller.h"
+#include "core/draft/role_predictor.h"
 #include "core/gsi/gsi_server.h"
 #include "core/session/match_session_controller.h"
 
@@ -41,6 +43,11 @@ void DraftController::bindSession(MatchSessionController* session)
     connect(m_session, &MatchSessionController::strategyTimeReached, this, &DraftController::onStrategyTime);
 }
 
+void DraftController::bindAdvisor(AdvisorController* advisor)
+{
+    m_advisor = advisor;
+}
+
 void DraftController::bindGsi(GsiServer* gsi)
 {
     m_gsi = gsi;
@@ -61,8 +68,12 @@ void DraftController::startGsi()
 
 void DraftController::simulateTurboDraft()
 {
+    m_evaluator.reset();
     if (m_session)
         m_session->simulateTurboDraft();
+    populateDemoAllies();
+    if (m_advisor)
+        m_advisor->loadDemoRecommendations();
     setStatus(tr("Демо: Turbo, разведка врагов в фазе банов"));
 }
 
@@ -92,7 +103,9 @@ void DraftController::onHeroPicked(int teamSlot, int heroId, const QString& hero
     slot.heroId = heroId;
     slot.heroName = heroName;
     slot.statusText = tr("Герой выбран");
+    applyRoleGuess(slot);
     m_enemies.updateSlot(teamSlot, slot);
+    refreshEvaluatorFromEnemies();
     m_debounce.start();
 }
 
@@ -154,6 +167,46 @@ void DraftController::scheduleStratzStub(int teamSlot, qint64 steamId)
             },
             Qt::QueuedConnection);
     });
+}
+
+void DraftController::applyRoleGuess(gemsight::EnemySlot& slot)
+{
+    const RoleGuess guess = RolePredictor::guessForPickOrder(slot.teamSlot);
+    slot.roleLabel = guess.label;
+    slot.roleConfidence = guess.confidence;
+}
+
+void DraftController::refreshEvaluatorFromEnemies()
+{
+    int revealed = 0;
+    for (int i = 0; i < 5; ++i) {
+        const QModelIndex idx = m_enemies.index(i);
+        if (m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt() > 0)
+            ++revealed;
+    }
+    m_evaluator.onEnemyPicksRevealed(revealed);
+}
+
+void DraftController::populateDemoAllies()
+{
+    const QList<QString> heroes = {
+        tr("Pudge"),
+        tr("Crystal Maiden"),
+        tr("Juggernaut"),
+        tr("Rubick"),
+        tr("Lion"),
+    };
+    for (int i = 0; i < 5; ++i) {
+        gemsight::EnemySlot slot;
+        slot.teamSlot = i;
+        slot.heroName = heroes.at(i);
+        slot.heroId = 100 + i;
+        slot.playerName = tr("Союзник %1").arg(i + 1);
+        slot.profileUnlocked = true;
+        slot.statusText = tr("Пик союзника");
+        applyRoleGuess(slot);
+        m_allies.updateSlot(i, slot);
+    }
 }
 
 } // namespace gemsight::core

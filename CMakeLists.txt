@@ -50,6 +50,10 @@ set(GEMSIGHT_SOURCES
     src/core/draft/game_mode_policy.cpp
     src/core/draft/intel_gate.cpp
     src/core/draft/draft_controller.cpp
+    src/core/draft/role_predictor.cpp
+    src/core/draft/draft_evaluator.cpp
+    src/core/advisor/pick_recommendation_model.cpp
+    src/core/advisor/advisor_controller.cpp
     src/models/enemy_team_model.cpp
     src/models/ally_team_model.cpp
 )

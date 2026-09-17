@@ -38,6 +38,10 @@ QVariant EnemyTeamModel::data(const QModelIndex& index, int role) const
         return slot.profileUnlocked;
     case SteamIdRole:
         return QVariant::fromValue(slot.steamId);
+    case RoleLabelRole:
+        return slot.roleLabel;
+    case RoleConfidenceRole:
+        return slot.roleConfidence;
     default:
         return {};
     }
@@ -54,6 +58,8 @@ QHash<int, QByteArray> EnemyTeamModel::roleNames() const
         {WinRateRole, "winRate"},
         {ProfileUnlockedRole, "profileUnlocked"},
         {SteamIdRole, "steamId"},
+        {RoleLabelRole, "roleLabel"},
+        {RoleConfidenceRole, "roleConfidence"},
     };
 }
 

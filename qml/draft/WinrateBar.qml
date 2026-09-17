@@ -8,7 +8,7 @@ RowLayout {
 
     property double winRate: 0.5
 
-    MD.Text {
+    MD.Label {
         text: qsTr("WR")
         typescale: MD.Token.typescale.label_small
         Layout.preferredWidth: 28
@@ -22,7 +22,7 @@ RowLayout {
         value: Math.max(0, Math.min(1, root.winRate))
     }
 
-    MD.Text {
+    MD.Label {
         text: Math.round(root.winRate * 1000) / 10 + "%"
         typescale: MD.Token.typescale.label_small
         Layout.preferredWidth: 48

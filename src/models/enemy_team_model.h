@@ -13,6 +13,8 @@ struct EnemySlot {
     double winRate = -1.0;
     bool profileUnlocked = false;
     qint64 steamId = 0;
+    QString roleLabel;
+    double roleConfidence = 0.0;
 };
 
 class EnemyTeamModel : public QAbstractListModel {
@@ -27,6 +29,8 @@ public:
         WinRateRole,
         ProfileUnlockedRole,
         SteamIdRole,
+        RoleLabelRole,
+        RoleConfidenceRole,
     };
     Q_ENUM(Roles)
 
