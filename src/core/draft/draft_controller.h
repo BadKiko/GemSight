@@ -3,7 +3,11 @@
 #include "core/cache/intel_cache.h"
 #include "core/draft/draft_evaluator.h"
 #include "core/draft/intel_gate.h"
+#include "core/meta/meta_matrix_store.h"
 #include "core/intel/player_intel_fetcher.h"
+#include "core/stratz/stratz_player_intel_service.h"
+#include "core/stratz/stratz_types.h"
+#include "core/draft/draft_snapshot.h"
 #include "models/enemy_team_model.h"
 #include "models/ally_team_model.h"
 
@@ -14,6 +18,7 @@ namespace gemsight::core {
 
 class MatchSessionController;
 class GsiServer;
+class SettingsStore;
 
 class DraftController : public QObject {
     Q_OBJECT
@@ -36,6 +41,7 @@ public:
 
     void bindSession(MatchSessionController* session);
     void bindAdvisor(class AdvisorController* advisor);
+    void bindSettings(SettingsStore* settings);
     void bindGsi(GsiServer* gsi);
 
     Q_INVOKABLE void startGsi();
@@ -52,7 +58,10 @@ private:
     void onHeroPicked(int teamSlot, int heroId, const QString& heroName);
     void onEnemySteam(int teamSlot, qint64 steamId, const QString& name);
     void onStrategyTime();
-    void scheduleStratzStub(int teamSlot, qint64 steamId);
+    void schedulePlayerIntel(int teamSlot, qint64 steamId);
+    void refreshAdvisor();
+    DraftSnapshot buildSnapshot() const;
+    void applyIntelToSlot(int teamSlot, qint64 steamId, const StratzPlayerIntel& stratz, const PlayerIntelResult& openDota);
     void applyRoleGuess(gemsight::EnemySlot& slot);
     void decorateHeroVisuals(gemsight::EnemySlot& slot, int heroId);
     void refreshEvaluatorFromEnemies();
@@ -61,7 +70,11 @@ private:
     gemsight::EnemyTeamModel m_enemies;
     gemsight::AllyTeamModel m_allies;
     IntelCache m_intelCache;
+    MetaMatrixStore m_metaMatrices;
     PlayerIntelFetcher m_intelFetcher;
+    StratzPlayerIntelService m_stratzService;
+    SettingsStore* m_settings = nullptr;
+    bool m_demoAdvisor = false;
     IntelGate m_gate;
     DraftEvaluator m_evaluator;
     QString m_activePatch = QStringLiteral("current");

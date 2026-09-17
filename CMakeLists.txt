@@ -57,6 +57,9 @@ set(GEMSIGHT_SOURCES
     src/core/heroes/hero_catalog.cpp
     src/core/cache/intel_cache.cpp
     src/core/intel/player_intel_fetcher.cpp
+    src/core/stratz/stratz_graphql_client.cpp
+    src/core/stratz/stratz_player_intel_service.cpp
+    src/core/meta/meta_matrix_store.cpp
     src/models/enemy_team_model.cpp
     src/models/lookahead_threat_model.cpp
     src/models/ally_team_model.cpp

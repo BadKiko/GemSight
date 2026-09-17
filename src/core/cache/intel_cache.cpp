@@ -59,7 +59,29 @@ bool IntelCache::ensureSchema()
         "weight REAL NOT NULL,"
         "PRIMARY KEY (hero_id, bracket, role)"
         ");"));
+
+    q.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS hero_matchup ("
+        "hero_id INTEGER NOT NULL,"
+        "vs_hero_id INTEGER NOT NULL,"
+        "advantage REAL NOT NULL,"
+        "PRIMARY KEY (hero_id, vs_hero_id)"
+        ");"));
     return true;
+}
+
+QString IntelCache::playerPayload(qint64 steamId, const QString& patch) const
+{
+    if (!m_db.isOpen() || steamId <= 0)
+        return {};
+
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT payload_json FROM player_profile WHERE steam_id = ? AND patch = ?"));
+    q.addBindValue(steamId);
+    q.addBindValue(patch);
+    if (!q.exec() || !q.next())
+        return {};
+    return q.value(0).toString();
 }
 
 QString IntelCache::avatarUrl(qint64 steamId, const QString& patch) const

@@ -13,7 +13,10 @@ public:
 
     bool open(const QString& filePath = QString());
     QString avatarUrl(qint64 steamId, const QString& patch) const;
+    QString playerPayload(qint64 steamId, const QString& patch) const;
     void putPlayerProfile(qint64 steamId, const QString& patch, const QString& avatarUrl, const QString& payloadJson);
+
+    QSqlDatabase database() const { return m_db; }
 
 private:
     bool ensureSchema();

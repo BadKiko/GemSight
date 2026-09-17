@@ -17,6 +17,8 @@ struct EnemySlot {
     double roleConfidence = 0.0;
     QString avatarUrl;
     QString heroPortraitUrl;
+    int signatureHeroId = 0;
+    QString signatureHeroPortraitUrl;
 };
 
 class EnemyTeamModel : public QAbstractListModel {
@@ -35,6 +37,8 @@ public:
         RoleConfidenceRole,
         AvatarUrlRole,
         HeroPortraitUrlRole,
+        SignatureHeroIdRole,
+        SignatureHeroPortraitUrlRole,
     };
     Q_ENUM(Roles)
 

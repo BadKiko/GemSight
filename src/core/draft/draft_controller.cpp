@@ -5,20 +5,45 @@
 #include "core/heroes/hero_catalog.h"
 #include "core/gsi/gsi_server.h"
 #include "core/session/match_session_controller.h"
+#include "core/settings/settings_store.h"
 
+#include <QJsonDocument>
 #include <QThread>
 #include <QtConcurrent>
 
 namespace gemsight::core {
 
+namespace {
+
+void applySignatureHero(gemsight::EnemySlot& slot, const QVector<StratzHeroPoolEntry>& heroes)
+{
+    if (heroes.isEmpty())
+        return;
+
+    StratzHeroPoolEntry best = heroes.first();
+    for (const StratzHeroPoolEntry& entry : heroes) {
+        if (entry.matchCount > best.matchCount)
+            best = entry;
+    }
+    slot.signatureHeroId = best.heroId;
+    slot.signatureHeroPortraitUrl = HeroCatalog::portraitUrl(best.heroId);
+}
+
+} // namespace
+
 DraftController::DraftController(QObject* parent)
     : QObject(parent)
 {
     m_intelCache.open();
+    m_metaMatrices.attachCache(&m_intelCache);
+    m_metaMatrices.ensureSeeded();
+
     m_debounce.setInterval(50);
     m_debounce.setSingleShot(true);
     connect(&m_debounce, &QTimer::timeout, this, [this]() {
         emit m_enemies.dataChanged(m_enemies.index(0, 0), m_enemies.index(4, 0));
+        if (!m_demoAdvisor)
+            refreshAdvisor();
     });
 }
 
@@ -50,6 +75,11 @@ void DraftController::bindAdvisor(AdvisorController* advisor)
     m_advisor = advisor;
 }
 
+void DraftController::bindSettings(SettingsStore* settings)
+{
+    m_settings = settings;
+}
+
 void DraftController::bindGsi(GsiServer* gsi)
 {
     m_gsi = gsi;
@@ -70,6 +100,7 @@ void DraftController::startGsi()
 
 void DraftController::simulateTurboDraft()
 {
+    m_demoAdvisor = true;
     m_evaluator.reset();
     if (m_session)
         m_session->simulateTurboDraft();
@@ -98,13 +129,15 @@ void DraftController::setStatus(const QString& line)
 
 void DraftController::onHeroPicked(int teamSlot, int heroId, const QString& heroName)
 {
+    Q_UNUSED(heroName);
     if (teamSlot < 0 || teamSlot >= 5)
         return;
+
+    m_demoAdvisor = false;
 
     gemsight::EnemySlot slot;
     slot.teamSlot = teamSlot;
     slot.heroId = heroId;
-    slot.heroName = heroName;
     slot.statusText = tr("Герой выбран");
     decorateHeroVisuals(slot, heroId);
     applyRoleGuess(slot);
@@ -122,6 +155,7 @@ void DraftController::onEnemySteam(int teamSlot, qint64 steamId, const QString& 
     const QModelIndex idx = m_enemies.index(teamSlot);
     slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
     slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
+    slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
     slot.teamSlot = teamSlot;
     slot.steamId = steamId;
 
@@ -130,7 +164,7 @@ void DraftController::onEnemySteam(int teamSlot, qint64 steamId, const QString& 
     if (allowed) {
         slot.playerName = name.isEmpty() ? QStringLiteral("ID %1").arg(steamId) : name;
         slot.statusText = tr("Профиль STRATZ…");
-        scheduleStratzStub(teamSlot, steamId);
+        schedulePlayerIntel(teamSlot, steamId);
     } else {
         slot.playerName = tr("Скрыто до Strategy Time");
         slot.statusText = tr("Только мета героя");
@@ -146,68 +180,118 @@ void DraftController::onStrategyTime()
         const QModelIndex idx = m_enemies.index(i);
         const qint64 steamId = m_enemies.data(idx, gemsight::EnemyTeamModel::SteamIdRole).toLongLong();
         if (steamId > 0 && m_gate.mayFetchEnemyProfile(steamId, i))
-            scheduleStratzStub(i, steamId);
+            schedulePlayerIntel(i, steamId);
     }
 }
 
-void DraftController::scheduleStratzStub(int teamSlot, qint64 steamId)
+void DraftController::applyIntelToSlot(
+    int teamSlot,
+    qint64 steamId,
+    const StratzPlayerIntel& stratz,
+    const PlayerIntelResult& openDota)
+{
+    gemsight::EnemySlot slot;
+    const QModelIndex idx = m_enemies.index(teamSlot);
+    slot.teamSlot = teamSlot;
+    slot.steamId = steamId;
+    slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
+    slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
+    slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
+    slot.playerName = m_enemies.data(idx, gemsight::EnemyTeamModel::PlayerNameRole).toString();
+
+    if (stratz.ok && !stratz.displayName.isEmpty())
+        slot.playerName = stratz.displayName;
+    else if (openDota.ok && !openDota.displayName.isEmpty())
+        slot.playerName = openDota.displayName;
+
+    if (!stratz.avatarUrl.isEmpty())
+        slot.avatarUrl = stratz.avatarUrl;
+    else if (openDota.ok)
+        slot.avatarUrl = openDota.avatarUrl;
+
+    if (stratz.winRate >= 0.0)
+        slot.winRate = stratz.winRate;
+    else
+        slot.winRate = 0.52 + (teamSlot * 0.01);
+
+    applySignatureHero(slot, stratz.heroes);
+    slot.profileUnlocked = true;
+
+    if (stratz.ok)
+        slot.statusText = tr("STRATZ");
+    else if (!slot.avatarUrl.isEmpty())
+        slot.statusText = tr("OpenDota / кэш");
+    else
+        slot.statusText = tr("Профиль (без аватара)");
+
+    applyRoleGuess(slot);
+    m_enemies.updateSlot(teamSlot, slot);
+}
+
+void DraftController::schedulePlayerIntel(int teamSlot, qint64 steamId)
 {
     const QString cachedAvatar = m_intelCache.avatarUrl(steamId, m_activePatch);
-    if (!cachedAvatar.isEmpty()) {
-        QMetaObject::invokeMethod(this, [this, teamSlot, steamId, cachedAvatar]() {
-            gemsight::EnemySlot slot;
-            const QModelIndex idx = m_enemies.index(teamSlot);
-            slot.teamSlot = teamSlot;
-            slot.steamId = steamId;
-            slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
-            slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
-            slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
-            slot.playerName = m_enemies.data(idx, gemsight::EnemyTeamModel::PlayerNameRole).toString();
-            slot.avatarUrl = cachedAvatar;
-            slot.profileUnlocked = true;
-            slot.winRate = 0.52 + (teamSlot * 0.01);
-            slot.statusText = tr("Кэш SQLite");
-            applyRoleGuess(slot);
-            m_enemies.updateSlot(teamSlot, slot);
-        }, Qt::QueuedConnection);
+    const QString cachedPayload = m_intelCache.playerPayload(steamId, m_activePatch);
+    const QString token = m_settings ? m_settings->stratzApiToken() : QString();
+
+    if (!cachedAvatar.isEmpty() && !cachedPayload.isEmpty()) {
+        StratzPlayerIntel parsed;
+        parsed.steamId = steamId;
+        const QJsonDocument doc = QJsonDocument::fromJson(cachedPayload.toUtf8());
+        if (doc.isObject()) {
+            StratzPlayerIntelService parser;
+            parsed = parser.parsePlayerData(doc.object(), steamId);
+        }
+        parsed.avatarUrl = cachedAvatar;
+        parsed.ok = true;
+        QMetaObject::invokeMethod(this, [this, teamSlot, steamId, parsed]() { applyIntelToSlot(teamSlot, steamId, parsed, {}); }, Qt::QueuedConnection);
         return;
     }
 
-    QtConcurrent::run([this, teamSlot, steamId]() {
-        QThread::msleep(250);
+    QtConcurrent::run([this, teamSlot, steamId, token]() {
+        StratzPlayerIntel stratz;
+        if (!token.isEmpty())
+            stratz = m_stratzService.fetchPlayer(token, steamId);
 
-        QString avatarUrl;
-        QString displayName;
-        const PlayerIntelResult intel = m_intelFetcher.fetchAvatarOpenDota(steamId);
-        if (intel.ok) {
-            avatarUrl = intel.avatarUrl;
-            displayName = intel.displayName;
-        }
+        PlayerIntelResult openDota;
+        if (!stratz.ok || stratz.avatarUrl.isEmpty())
+            openDota = m_intelFetcher.fetchAvatarOpenDota(steamId);
 
         QMetaObject::invokeMethod(
             this,
-            [this, teamSlot, steamId, avatarUrl, displayName]() {
-                if (!avatarUrl.isEmpty())
-                    m_intelCache.putPlayerProfile(steamId, m_activePatch, avatarUrl, QString());
-                gemsight::EnemySlot slot;
-                const QModelIndex idx = m_enemies.index(teamSlot);
-                slot.teamSlot = teamSlot;
-                slot.steamId = steamId;
-                slot.heroId = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt();
-                slot.heroName = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroNameRole).toString();
-                slot.heroPortraitUrl = m_enemies.data(idx, gemsight::EnemyTeamModel::HeroPortraitUrlRole).toString();
-                slot.playerName = m_enemies.data(idx, gemsight::EnemyTeamModel::PlayerNameRole).toString();
-                if (!displayName.isEmpty())
-                    slot.playerName = displayName;
-                slot.avatarUrl = avatarUrl;
-                slot.profileUnlocked = true;
-                slot.winRate = 0.52 + (teamSlot * 0.01);
-                slot.statusText = avatarUrl.isEmpty() ? tr("Профиль (без аватара)") : tr("OpenDota / кэш");
-                applyRoleGuess(slot);
-                m_enemies.updateSlot(teamSlot, slot);
+            [this, teamSlot, steamId, stratz, openDota]() {
+                const QString avatar = !stratz.avatarUrl.isEmpty() ? stratz.avatarUrl : openDota.avatarUrl;
+                const QString payload = stratz.rawJson;
+                if (!avatar.isEmpty() || !payload.isEmpty())
+                    m_intelCache.putPlayerProfile(steamId, m_activePatch, avatar, payload);
+                applyIntelToSlot(teamSlot, steamId, stratz, openDota);
+                if (!m_demoAdvisor)
+                    refreshAdvisor();
             },
             Qt::QueuedConnection);
     });
+}
+
+DraftSnapshot DraftController::buildSnapshot() const
+{
+    DraftSnapshot snap;
+    for (int i = 0; i < 5; ++i) {
+        const QModelIndex idx = m_enemies.index(i);
+        snap.enemyHeroIds.push_back(m_enemies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt());
+        snap.enemySteamIds.push_back(m_enemies.data(idx, gemsight::EnemyTeamModel::SteamIdRole).toLongLong());
+    }
+    for (int i = 0; i < 5; ++i) {
+        const QModelIndex idx = m_allies.index(i);
+        snap.allyHeroIds.push_back(m_allies.data(idx, gemsight::EnemyTeamModel::HeroIdRole).toInt());
+    }
+    return snap;
+}
+
+void DraftController::refreshAdvisor()
+{
+    if (!m_advisor || m_demoAdvisor)
+        return;
+    m_advisor->evaluateFromDraft(buildSnapshot(), &m_metaMatrices);
 }
 
 void DraftController::decorateHeroVisuals(gemsight::EnemySlot& slot, int heroId)

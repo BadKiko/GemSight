@@ -19,6 +19,7 @@ MD.Card {
     property double roleConfidence: 0
     property url avatarUrl
     property url heroPortraitUrl
+    property url signatureHeroPortraitUrl
 
     MD.MProp.elevation: MD.MProp.elevation.level1
     type: MD.Enum.CardOutlined
@@ -86,6 +87,27 @@ MD.Card {
                 Layout.rightMargin: MD.Token.spacing.medium
                 visible: root.profileOpen && root.displayWinRate >= 0
                 winRate: root.displayWinRate
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: MD.Token.spacing.medium
+                Layout.rightMargin: MD.Token.spacing.medium
+                visible: root.signatureHeroPortraitUrl.toString().length > 0
+                spacing: MD.Token.spacing.small
+
+                MD.Label {
+                    text: qsTr("Сигнатура")
+                    typescale: MD.Token.typescale.label_small
+                    color: MD.MProp.color.on_surface_variant
+                }
+
+                HeroPortrait {
+                    Layout.preferredWidth: 48
+                    Layout.preferredHeight: 28
+                    source: root.signatureHeroPortraitUrl
+                    fallbackText: "★"
+                }
             }
 
             MD.Label {

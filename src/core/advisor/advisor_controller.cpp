@@ -1,8 +1,10 @@
 #include "core/advisor/advisor_controller.h"
 
 #include "core/heroes/hero_catalog.h"
+#include "core/meta/meta_matrix_store.h"
 
 #include <algorithm>
+#include <QHash>
 
 namespace gemsight::core {
 
@@ -138,6 +140,90 @@ void AdvisorController::loadDemoRecommendations()
         18,
         2,
         false));
+
+    sortRecommendations(rows);
+    if (rows.size() > 8)
+        rows.resize(8);
+
+    m_model.resetRows(rows);
+    emit recommendationsReady();
+}
+
+void AdvisorController::evaluateFromDraft(const DraftSnapshot& snap, const MetaMatrixStore* matrices)
+{
+    if (!matrices || snap.enemyHeroIds.isEmpty())
+        return;
+
+    static const QHash<int, int> kLocalGames = {
+        {110, 1240},
+        {76, 890},
+        {16, 210},
+        {53, 760},
+        {39, 18},
+        {8, 420},
+        {14, 980},
+        {5, 310},
+        {86, 150},
+        {26, 540},
+    };
+
+    const QList<int> candidates = {110, 76, 16, 53, 39, 8, 14, 5, 86, 26};
+    QVector<int> enemies;
+    for (int id : snap.enemyHeroIds) {
+        if (id > 0)
+            enemies.push_back(id);
+    }
+    if (enemies.isEmpty())
+        return;
+
+    QVector<PickRecommendationRow> rows;
+    const int minGames = 50;
+    const double viableFloor = -1.5;
+    const double highRiskCeiling = -4.0;
+    const double metaOnlyFloor = 2.5;
+    const double signatureMastery = 0.65;
+
+    for (int heroId : candidates) {
+        const double matchup = matrices->matchupAdvantage(heroId, enemies);
+        const int games = kLocalGames.value(heroId, 0);
+        const double mastery = games > 0 ? qMin(1.0, games / 1500.0) : 0.1;
+        const bool signature = games >= 100 || mastery >= signatureMastery;
+        const double score = m_weightMatchup * (matchup / 10.0) + m_weightMastery * mastery;
+
+        PickTier tier = PickTier::Neutral;
+        QString message = tr("Нейтральный вариант по сумме матчапа и опыта");
+
+        if (signature && matchup >= 0.0) {
+            tier = PickTier::Recommended;
+            message = tr("Рекомендуется: комфортный сигнатурный пик с плюсом в драфте");
+        } else if (signature && matchup >= viableFloor) {
+            tier = PickTier::Viable;
+            message = tr("Играбельно: лёгкий минус в матчапе, но сильный опыт на герое");
+        } else if (games < minGames && matchup >= metaOnlyFloor && !m_aggressiveMeta) {
+            tier = PickTier::WarningMetaOnly;
+            message = tr("Мета-контрпик: осторожно — герой не отыгран");
+        } else if (signature && matchup <= highRiskCeiling) {
+            tier = PickTier::WarningHighRisk;
+            message = tr("Высокий риск: сильные контрпики врага на сигнатуру");
+        }
+
+        if (games < minGames && !m_aggressiveMeta && (tier == PickTier::Recommended || tier == PickTier::Viable))
+            tier = PickTier::WarningMetaOnly;
+
+        PickRecommendationRow row;
+        row.heroId = heroId;
+        row.heroName = HeroCatalog::displayName(heroId);
+        row.heroPortraitUrl = HeroCatalog::portraitUrl(heroId);
+        row.score = score;
+        row.tier = tier;
+        row.message = message;
+        row.matchupAdvantage = matchup;
+        row.personalMastery = mastery;
+        row.gamesTotal = games;
+        row.games30d = 0;
+        row.isSignature = signature;
+        rows.push_back(row);
+    }
 
     sortRecommendations(rows);
     if (rows.size() > 8)

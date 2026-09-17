@@ -52,6 +52,7 @@ Item {
                         required property double roleConfidence
                         required property string avatarUrl
                         required property string heroPortraitUrl
+                        required property string signatureHeroPortraitUrl
 
                         width: Math.max(168, (enemyList.width - 4 * enemyList.spacing) / 5)
                         height: enemyList.height
@@ -65,6 +66,7 @@ Item {
                         roleConfidence: roleConfidence
                         avatarUrl: avatarUrl
                         heroPortraitUrl: heroPortraitUrl
+                        signatureHeroPortraitUrl: signatureHeroPortraitUrl
                     }
                 }
             }

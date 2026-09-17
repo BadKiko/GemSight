@@ -1,10 +1,13 @@
 #pragma once
 
 #include "core/advisor/pick_recommendation_model.h"
+#include "core/draft/draft_snapshot.h"
 
 #include <QObject>
 
 namespace gemsight::core {
+
+class MetaMatrixStore;
 
 class AdvisorController : public QObject {
     Q_OBJECT
@@ -26,6 +29,7 @@ public:
     void setAdvisorAggressiveMeta(bool v);
 
     Q_INVOKABLE void loadDemoRecommendations();
+    void evaluateFromDraft(const DraftSnapshot& snap, const MetaMatrixStore* matrices);
 
 signals:
     void recommendationsReady();
