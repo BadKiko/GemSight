@@ -30,6 +30,10 @@ $env:CMAKE_PREFIX_PATH = "C:\Qt\6.11.3\mingw_64"
 
 Env: `BUILD_TYPE`, `QT_INSTALL_DIR`, `GEMSIGHT_QT_KIT`, `FETCHCONTENT_BASE_DIR` (see `.\run.ps1 --help`).
 
+### STRATZ (M3)
+
+In-app **Settings** (gear on the rail): paste your [STRATZ](https://stratz.com/api) GraphQL token. Enemy profiles load via STRATZ when the token is set; otherwise OpenDota avatar fallback. Pick advisor recalculates from SQLite matchup matrix on live draft updates (demo Turbo still uses fixed tier examples).
+
 ## GSI
 
 Copy `resources/gsi/gamestate_integration_gemsight.cfg` into Dota’s `game/dota/cfg/gamestate_integration/` and add Steam launch option `-gamestateintegration`.

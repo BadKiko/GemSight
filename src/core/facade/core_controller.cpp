@@ -18,6 +18,8 @@ CoreController::CoreController(QObject* parent)
 {
     m_draft.bindSession(&m_session);
     m_draft.bindGsi(&m_gsi);
+    m_draft.bindAdvisor(&m_advisor);
+    m_draft.bindSettings(&m_settings);
     connect(&m_session, &MatchSessionController::matchPhaseChanged, this, [this]() {
         emit matchPhaseChanged();
     });
